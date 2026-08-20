@@ -31,12 +31,7 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GATE = (
-    REPO_ROOT
-    / "scripts"
-    / "repo-templates"
-    / ".github"
-    / "workflows"
-    / "codex-review-window.yml"
+    REPO_ROOT / ".github" / "workflows" / "codex-review-window.yml"
 )
 SCRIPT = yaml.safe_load(GATE.read_text(encoding="utf-8"))["jobs"]["codex-review-window"][
     "steps"

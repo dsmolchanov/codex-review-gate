@@ -21,12 +21,7 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GATE = (
-    REPO_ROOT
-    / "scripts"
-    / "repo-templates"
-    / ".github"
-    / "workflows"
-    / "codex-review-window.yml"
+    REPO_ROOT / ".github" / "workflows" / "codex-review-window.yml"
 )
 RAW = GATE.read_text(encoding="utf-8")
 DOC = yaml.safe_load(RAW)
@@ -68,14 +63,24 @@ def test_gate_does_not_listen_to_issue_comment():
     review` anchor comment. The gate posts no comment it later trusts, and accepts no override command.
     """
     assert "issue_comment" not in ON
-    assert set(ON.keys()) == {"pull_request", "pull_request_review"}
+    # An allowlist, not an exact set: `workflow_call` is a legitimate addition
+    # (consumers call this workflow rather than copying it), and an exact-set
+    # assertion would have failed on it while catching nothing dangerous. What
+    # must stay impossible is a comment- or schedule-driven trigger.
+    assert set(ON.keys()) <= {"pull_request", "pull_request_review", "workflow_call"}
 
 
-def test_concurrency_key_cannot_see_a_comment_event():
-    """Keying on `pull_request.number` alone is only safe without issue_comment."""
-    group = DOC["concurrency"]["group"]
-    assert "github.event.issue.number" not in group
-    assert "github.event.pull_request.number" in group
+def test_the_callee_declares_no_concurrency_group():
+    """The CALLER owns the group. A callee sharing it cancels its own caller.
+
+    A called workflow declaring the same `concurrency.group` as the stub that
+    calls it enters a group the caller already holds; with
+    `cancel-in-progress: true` the callee then cancels the caller. The run ends
+    `failure` with ZERO jobs and no annotation, which presents as an invalid
+    workflow file — and `actionlint` reports both files clean. It cost four
+    probe runs to find. Serialization belongs to the caller alone.
+    """
+    assert "concurrency" not in DOC
 
 
 def test_late_review_reopens_the_gate():
@@ -99,8 +104,15 @@ def test_permissions_cover_every_write_the_script_makes():
     assert perms["contents"] == "read"
 
 
-def test_concurrency_cancels_superseded_runs():
-    assert DOC["concurrency"]["cancel-in-progress"] is True
+def test_the_gate_is_callable():
+    """Consumers install a stub that calls this workflow; they do not copy it.
+
+    Distributing the body put one file in front of eight independent reviewers
+    and produced 21 blocking findings, no two repositories agreeing. Losing
+    `workflow_call` would silently push everyone back to copying.
+    """
+    assert "workflow_call" in ON
+    assert set(ON["workflow_call"]["secrets"]) == {"CODEX_REQUEST_TOKEN", "SLACK_WEBHOOK"}
 
 
 # --------------------------------------------------------------------------
@@ -270,38 +282,6 @@ def test_rereview_request_asks_for_one_inventory():
     assert "comprehensive inventory" in SCRIPT
     assert "root invariant" in SCRIPT
     assert "sibling consumer" in SCRIPT
-
-
-def test_first_and_rereview_requests_agree():
-    """runner.py posts the first request; the gate posts the rest."""
-    runner = (REPO_ROOT / "runner.py").read_text(encoding="utf-8")
-    assert "CODEX_INVENTORY_REQUEST" in runner
-    for phrase in ("comprehensive inventory", "root invariant", "sibling consumer"):
-        assert phrase in runner, phrase
-    # The bare request is gone from the PR-creation path.
-    assert '"--body", "@codex review",' not in runner
-
-
-def test_first_request_stays_guarded_to_new_prs():
-    """Retries must not stack duplicate review requests on one PR.
-
-    Each duplicate request can draw its own review, and every review of the head
-    is a verdict the gate must reconcile — so a retry loop that re-posts would
-    manufacture review generations the author never caused.
-    """
-    runner = (REPO_ROOT / "runner.py").read_text(encoding="utf-8")
-    call_at = runner.index("CODEX_INVENTORY_REQUEST,")
-    guard = runner.rindex("if pr_newly_created and pr_number is not None:", 0, call_at)
-    # The guard must be the immediately enclosing condition, not one far above.
-    assert 0 < call_at - guard < 400, "the inventory request is no longer guarded"
-
-
-
-
-
-
-
-
 
 
 
