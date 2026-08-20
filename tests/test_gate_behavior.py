@@ -180,7 +180,7 @@ def run_gate(
         "VERDICT_WINDOW_SECONDS": "0",
         "SETTLE_SECONDS": "0",
         # The grace window defaults to 90s in production, to cover the 59s
-        # review-publication lag recorded on NeoMenu#658. Tests set it explicitly
+        # review-publication lag recorded in the motivating incident. Tests set it explicitly
         # per case: 0 where the wait is irrelevant, non-zero where the point IS
         # that a late review is caught.
         "GRACE_SECONDS": grace,
@@ -254,7 +254,7 @@ def test_review_body_blocker_is_red(tmp_path):
 def test_no_verdict_is_red(tmp_path):
     """Absence of a verdict is not approval.
 
-    This is the exact path that let NeoMenu #656/#657/#658 merge with open P1s.
+    This is the exact path that let three consecutive PRs merge with open P1s.
     """
     fx = base_fixture()
     fx["routes"]["pulls/7/reviews"] = {"*": ""}
@@ -298,7 +298,7 @@ def test_inline_finding_read_failure_is_red_not_clean(tmp_path):
 def test_quota_exhaustion_is_red_and_named(tmp_path):
     """A quota outage blocks every merge behind the gate, so it must say so.
 
-    In NeoMenu it went unnoticed for three days and eleven PRs merged unreviewed.
+    It once went unnoticed for three days; eleven PRs merged unreviewed.
     """
     fx = base_fixture()
     fx["routes"]["pulls/7/reviews"] = {"*": ""}
@@ -467,7 +467,7 @@ def test_a_review_published_after_the_clean_signal_still_blocks(tmp_path):
     """The core race, in its last surviving form.
 
     Codex announces a verdict with a summary comment or a 👍 and PUBLISHES the
-    formal review moments later — 59 seconds later on NeoMenu#658. The gate broke
+    formal review moments later — 59 seconds later in the motivating incident. The gate broke
     out of its wait on the clean signal and rechecked ONCE after 15 seconds, so a
     review arriving at 59s was missed, the gate exited 0, and auto-merge consumed
     the green check before the P1s appeared. That is precisely the race this file

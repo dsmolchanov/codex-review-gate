@@ -351,7 +351,7 @@ def test_review_requests_use_a_codex_connected_identity():
 
     Every GITHUB_TOKEN comment is authored by `github-actions[bot]`, an identity
     with no Codex account: Codex answers "create a Codex account and connect to
-    github" within seconds and never reviews. On abrolia that silently blocked
+    github" within seconds and never reviews. In one repository that silently blocked
     four PRs for six days across thirteen requests, presenting as a flaky timeout
     rather than a rejected request.
     """
