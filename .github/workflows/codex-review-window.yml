@@ -205,7 +205,7 @@ jobs:
 
           # Re-read the head rather than trusting the event payload: this is what
           # lets the debounce below notice a head that moved mid-run.
-          HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
+          HEAD_SHA=$(api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
           if [ -z "${HEAD_SHA}" ]; then
             echo "::error::Could not resolve the head SHA for PR #${PR}. The verdict is UNKNOWN, so the gate holds the merge."
             exit 1
@@ -236,7 +236,7 @@ jobs:
           if [ "${ACTION}" = "synchronize" ] && [ "${DEBOUNCE_SECONDS}" -gt 0 ]; then
             echo "Debouncing ${DEBOUNCE_SECONDS}s so a burst of pushes costs one review generation."
             sleep "${DEBOUNCE_SECONDS}"
-            HEAD_NOW=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
+            HEAD_NOW=$(api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
             if [ "${HEAD_NOW}" != "${HEAD_SHA}" ]; then
               echo "::error::Head moved ${HEAD_SHA} -> ${HEAD_NOW} during the debounce window. This run is superseded; the run for the new head decides. Failing rather than skipping, because a skipped required check would satisfy branch protection."
               exit 1
