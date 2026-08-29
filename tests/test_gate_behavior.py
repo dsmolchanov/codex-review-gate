@@ -557,3 +557,192 @@ def test_a_request_failure_without_an_identity_keeps_the_old_fallback(tmp_path):
     assert "cannot post the review request" not in result.stdout
     assert "No CODEX_REQUEST_TOKEN is configured" in result.stdout
     assert "UNKNOWN" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# Round budget: delta re-review requests and the P0-only degrade
+# --------------------------------------------------------------------------
+#
+# Round state is derived from COMPLETED verdicts only: formal reviews (their
+# commit_id) and clean-summary comments (a full SHA in a CODEX_BOT body). The
+# stub routes the round-state reads by unique jq-filter substrings:
+# `submitted_at` for the reviews read, `capture(` for the comments read. A
+# request anchor is neither, which is the point — an anchored-but-unverdicted
+# head (a push cancelled the run that would have waited) must not advance the
+# round or become a delta base.
+
+OLD1 = "b" * 40
+OLD2 = "c" * 40
+OLD3 = "d" * 40
+
+
+def verdict_heads(*shas):
+    """Rendered output of the reviews-side round-state read: oldest first."""
+    return "\n".join(
+        f"2026-08-{i + 1:02d}T00:00:00Z {sha}" for i, sha in enumerate(shas)
+    )
+
+
+def round_fixture(*prior, head_review: bool):
+    """N prior verdict-bearing heads; the current head reviewed or not."""
+    fx = base_fixture()
+    fx["routes"]["pulls/7/reviews"] = {
+        "submitted_at": verdict_heads(*prior),
+        'commit_id == "': "555" if head_review else "",
+        "*": "",
+    }
+    if not head_review:
+        fx["routes"]["pulls/7/comments"] = {"*": ""}
+    return fx
+
+
+def posted_bodies(tmp_path):
+    return (tmp_path / "run0" / "calls.log").read_text()
+
+
+def test_first_round_requests_the_full_inventory(tmp_path):
+    """No completed verdict yet: ask for the full inventory, no commit range."""
+    fx = round_fixture(head_review=False)
+    result = run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "comprehensive inventory" in calls
+    assert f"..{HEAD}" not in calls, f"round 1 asked for a delta:\n{calls}"
+    assert "Review round 1:" in result.stdout
+    assert result.returncode != 0  # no verdict ever arrives — still red
+
+
+def test_an_anchored_but_unverdicted_head_is_not_reviewed(tmp_path):
+    """The cancellation race: a request was posted, the run died, nothing came.
+
+    The prior head left an anchor comment but no verdict of any kind. Anchors
+    are invisible to the round-state reads (they are neither reviews nor
+    clean summaries), so the next round must be a FULL round — treating the
+    anchored head as reviewed would leave base..old-head unreviewed forever.
+    """
+    fx = round_fixture(head_review=False)
+    # An anchor for the CURRENT head also exists (this run's predecessor posted
+    # it before being cancelled): the gate then posts no new request, and the
+    # round state must still say round 1.
+    fx["routes"]["issues/7/comments"] = {
+        "codex-review-window head": "9001",  # anchor_comment_id() finds it
+        "capture(": "",                      # no clean-summary verdicts
+        "=.id": "9001",
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert "Review round 1:" in result.stdout
+    assert "Degraded" not in result.stdout
+    assert result.returncode != 0
+    assert "UNKNOWN" in result.stdout
+
+
+def test_second_round_requests_only_the_delta(tmp_path):
+    """One completed verdict: the request scopes new findings to prev..head,
+    with the delta base being the most recently VERDICTED head."""
+    fx = round_fixture(OLD1, OLD2, head_review=False)
+    result = run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert f"{OLD2}..{HEAD}" in calls, f"delta range missing or wrong base:\n{calls}"
+    assert "RE-EMIT each still-open P0/P1" in calls
+    assert "Review round 3:" in result.stdout
+
+
+def test_clean_summary_verdicts_count_toward_the_round(tmp_path):
+    """A requested re-review that finds nothing comes back as a comment, not a
+    review. It is a completed verdict and must advance the round."""
+    fx = round_fixture(head_review=False)
+    fx["routes"]["issues/7/comments"] = {
+        "capture(": f"2026-08-01T00:00:00Z {OLD1}",
+        "=.id": "9001",
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert f"{OLD1}..{HEAD}" in calls
+    assert "Review round 2:" in result.stdout
+
+
+def test_p1_blocks_before_the_cap(tmp_path):
+    """Two completed rounds: still a full round, a P1 badge still blocks."""
+    fx = round_fixture(OLD1, OLD2, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert "Review round 3:" in result.stdout
+    assert result.returncode != 0, f"a P1 merged before the cap:\n{result.stdout}"
+
+
+def test_p1_does_not_block_after_the_cap(tmp_path):
+    """Three completed rounds: the budget is spent, P1s stop holding the merge."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert "Degraded round 4:" in result.stdout
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+def test_p1_in_review_body_does_not_block_after_the_cap(tmp_path):
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {"*": ""}
+    fx["routes"]["pulls/7/reviews/555"] = {"*": P1_BODY_NO_BLOCKER}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.parametrize("where", ["inline", "body"])
+def test_p0_still_blocks_after_the_cap(tmp_path, where):
+    """The degrade narrows the gate to P0 — it never opens it."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    if where == "inline":
+        fx["routes"]["pulls/7/comments"] = {
+            "pull_request_review_id": P0_BODY_NO_BLOCKER,
+            "*": "",
+        }
+    else:
+        fx["routes"]["pulls/7/comments"] = {"*": ""}
+        fx["routes"]["pulls/7/reviews/555"] = {"*": P0_BODY_NO_BLOCKER}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, f"a P0 merged on a degraded round:\n{result.stdout}"
+    assert "P0" in result.stdout
+
+
+def test_rerun_on_the_same_head_does_not_advance_the_round(tmp_path):
+    """A verdict on the CURRENT head is this round's verdict, not a prior one.
+
+    Re-running the gate on the same head (or the submitted-event replacement
+    run) must not push the PR toward the degrade.
+    """
+    fx = round_fixture(OLD1, OLD2, HEAD, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert "Review round 3:" in result.stdout
+    assert result.returncode != 0
+
+
+def test_verdict_history_read_failure_is_red(tmp_path):
+    """The round-state comment read selects the blocking pattern, so an API
+    failure there must be UNKNOWN — never 'round 1'."""
+    fx = base_fixture()
+    fx["routes"]["issues/7/comments"] = "__FAIL__"
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0
+    assert "UNKNOWN" in result.stdout + result.stderr
+
+
+def test_no_verdict_is_still_red_after_the_cap(tmp_path):
+    """The budget narrows severity; it never overrides a missing verdict."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=False)
+    result = run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "Non-blocking notes" in calls  # the degraded request was posted
+    assert f"{OLD3}..{HEAD}" in calls
+    assert result.returncode != 0
+    assert "UNKNOWN" in result.stdout

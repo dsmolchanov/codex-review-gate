@@ -36,24 +36,33 @@ on:
 # ---------------------------------------------------------------------------
 # WHAT THIS GATE DOES, AND DELIBERATELY DOES NOT DO
 # ---------------------------------------------------------------------------
-# It answers exactly one question: does Codex report a P0/P1/[BLOCKER] on the
+# It answers exactly one question: does Codex report a blocking finding on the
 # CURRENT head commit? Verdict states are PASS / BLOCK / UNKNOWN, and only PASS
-# exits 0. That is the whole contract.
+# exits 0. That is the whole contract. What counts as "blocking" narrows after
+# the review budget is spent: for the first FULL_ROUNDS completed review
+# generations it is any P0/P1/[BLOCKER]; from then on it is P0 only, with P1s
+# still reported (badges kept, so Auto-fix still sees them) but no longer
+# holding the merge. UNKNOWN fails in every round — the budget never overrides
+# a missing verdict.
 #
-# It does NOT count fix generations, enforce a diff budget, apply labels, or
-# accept a waiver command. An earlier revision of this file did all four; the
-# machinery grew it from 81 to 591 lines and drew five rounds of valid P1
-# findings, three of which were unfixable here at all — a workflow using
-# GITHUB_TOKEN cannot authenticate a marker it reads (every workflow is
-# `github-actions[bot]`), and a stateless run cannot hold a lease. Those
-# features need an authenticated identity and persisted state, so they moved to
-# a separate App-owned controller, which is out of scope for this file.
+# It counts REVIEW GENERATIONS statelessly, from COMPLETED head-bound verdicts:
+# a Codex review's commit_id, or a Codex clean-summary comment naming a head.
+# Request anchors never advance the count — an anchor proves a request was
+# posted, not that review completed. The count is derived only from
+# CODEX_BOT-authored artifacts, so pre-degrading a PR would take Codex's own
+# identity: the same trust bar every verdict already rests on. Re-review
+# requests are scoped to the commit range since the last completed verdict and
+# require still-open prior findings to be re-emitted with their badges, so an
+# unresolved P1 on an earlier head cannot vanish behind a clean delta.
 #
-# Rounds are reduced instead by the two changes that need no state: AGENTS.md no
-# longer elevates two open-ended predicates to P1, and the review request asks
-# for one comprehensive inventory rather than accepting a trickle. Those shrink
-# the expected round count; they do not hard-cap it. The cap is controller work,
-# and pretending otherwise here is what produced the 591-line version.
+# It still does NOT enforce a diff budget, apply labels, or accept a waiver
+# command. An earlier revision of this file did; the machinery grew it from 81
+# to 591 lines and drew five rounds of valid P1 findings, three of which were
+# unfixable here at all — a workflow using GITHUB_TOKEN cannot authenticate a
+# marker it reads (every workflow is `github-actions[bot]`), and a stateless
+# run cannot hold a lease. Nothing here reads a marker to AUTHORIZE anything:
+# round state only narrows the blocking severity on the current head, and only
+# after three completed verdicts by the reviewer itself.
 #
 # A human stops automation by applying the `needs-human` label, which server.py
 # treats as terminal. Human-applied, so there is nothing to forge and no lease to
@@ -78,7 +87,8 @@ on:
 #      anchor, or the verbatim "Codex Review: Didn't find any major issues."
 #      summary naming this head and carrying no P0/P1 marker), re-checked for a
 #      late formal review before it is honoured;
-#   2. a head-bound review carrying no P0/P1 marker.
+#   2. a head-bound review carrying no blocking marker — P0/P1/[BLOCKER] on
+#      full rounds, P0 only once the review budget is spent.
 # Everything else — no verdict, quota exhausted, any GitHub API failure, an
 # unresolvable or superseded head, any open blocker — exits 1.
 #
@@ -225,6 +235,12 @@ jobs:
           # backslashes doubled — `\[` alone is an invalid escape and jq refuses
           # to compile the program.
           JQ_PATTERN='\\[BLOCKER\\]|badge/P[01]|P[01] Badge'
+          # The verbatim clean-verdict sentence. Defined here, next to the
+          # patterns, because the round-state read below needs it before the
+          # clean-signal helpers are declared. See the comment above
+          # codex_clean_comment_for_head() for why the SENTENCE is required and
+          # the marker test alone is not.
+          CLEAN_VERDICT="Codex Review: Didn't find any major issues."
 
           # ---------------------------------------------------------------
           # Debounce. Wait IN-RUN, then re-read the head. If it moved, a newer
@@ -294,6 +310,62 @@ jobs:
             echo "::warning::No CODEX_REQUEST_TOKEN is configured, so a review request would be posted as ${ANCHOR_AUTHOR}, which Codex refuses. Only Codex Automatic Reviews (PR opened / marked ready) can produce a verdict here; a verdict for a PUSHED head will never arrive and this gate will time out."
           fi
 
+          # ---------------------------------------------------------------
+          # Round state, computed statelessly from COMPLETED verdicts.
+          #
+          # A "reviewed head" is a head with a head-bound Codex verdict: a
+          # formal review whose commit_id names it, or a clean-summary comment
+          # carrying its full SHA. Request ANCHORS deliberately do not count —
+          # an anchor proves a request was posted, not that review completed.
+          # A push that cancels a pending run leaves an anchor with no verdict;
+          # counting it would let base..old-head go unreviewed while the next
+          # round reviews only old-head..new-head. Undercounting (a clean
+          # signal that arrived only as a reaction, or a summary naming only a
+          # short SHA) is the fail-safe direction: the delta base moves further
+          # back and the degrade fires later.
+          #
+          # Both reads go through api(): they select the request text and the
+          # blocking pattern, so a failed read must be UNKNOWN (exit 1), never
+          # "round 1".
+          VERDICT_LINES=$(
+            api "repos/${REPO}/pulls/${PR}/reviews" \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | \"\(.submitted_at) \(.commit_id)\"] | .[]"
+            api "repos/${REPO}/issues/${PR}/comments" \
+              --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\")) | select(.body | test(\"[0-9a-f]{40}\")) | \"\(.created_at) \(.body | capture(\"(?<s>[0-9a-f]{40})\").s)\"] | .[]"
+          )
+          # Oldest verdict first; one line per distinct prior head, the most
+          # recently verdicted one last. NF==2 drops anything that is not a
+          # "<timestamp> <sha>" record, so a mis-shaped row can only shrink the
+          # count — never inflate it.
+          PRIOR_HEADS=$(printf '%s\n' "${VERDICT_LINES}" | sort \
+            | awk -v cur="${HEAD_SHA}" 'NF == 2 && $2 != cur && !seen[$2]++ {print $2}')
+          REVIEWED_COUNT=$(printf '%s' "${PRIOR_HEADS}" | grep -c . || [ $? -eq 1 ])
+          PREV_HEAD=$(printf '%s\n' "${PRIOR_HEADS}" | tail -1)
+          ROUND=$((REVIEWED_COUNT + 1))
+          # Overridable the same way as VERDICT_WINDOW_SECONDS: an undeclared
+          # env var, not a workflow input — a consumer stub cannot loosen it.
+          FULL_ROUNDS="${FULL_ROUNDS:-3}"
+          DEGRADED=0
+          if [ "${REVIEWED_COUNT}" -ge "${FULL_ROUNDS}" ]; then
+            DEGRADED=1
+          fi
+          echo "Review round ${ROUND}: ${REVIEWED_COUNT} prior head(s) hold a completed verdict (budget: ${FULL_ROUNDS} full rounds)."
+
+          # On degraded rounds only P0 holds the merge. [BLOCKER] is the P1 tag
+          # in this fleet's review policy, so it is deliberately absent from
+          # this pattern — including it would make the degrade a no-op for
+          # prose-tagged P1s. No jq twin is needed: this pattern contains no
+          # brackets and is consumed only by grep via count_matches. The
+          # clean-signal jq keeps the FULL JQ_PATTERN in every round — a
+          # summary claiming "no major issues" while carrying any badge stays
+          # contradictory, and the blocking reading wins.
+          P0_PATTERN='badge/P0|P0 Badge'
+          ACTIVE_PATTERN="${PATTERN}"
+          if [ "${DEGRADED}" -eq 1 ]; then
+            ACTIVE_PATTERN="${P0_PATTERN}"
+            echo "Degraded round ${ROUND}: only P0 findings hold the merge; P1s keep their badges for the batch fix but do not block."
+          fi
+
           # Codex auto-reviews on open/ready but NOT on pushes, so ask for the
           # re-review — and leave the anchor behind either way. The request asks
           # for ONE comprehensive inventory: a bare "@codex review" returns
@@ -313,7 +385,24 @@ jobs:
           case "${ACTION}" in
             synchronize|reopened|ready_for_review|submitted)
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_ids_for_head)" ]; then
-                REQUEST_BODY=$(printf '@codex review\n\nReturn ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.\n\n<!-- %s -->' "${ANCHOR}")
+                # Three request shapes, one per round state. Round 1 keeps the
+                # posted text byte-identical to CODEX_INVENTORY_REQUEST in
+                # dev-agent's runner.py — the two are kept in sync deliberately.
+                # Rounds >= 2 scope the review to the range since the last
+                # COMPLETED verdict and require still-open prior findings to be
+                # re-emitted with their badges, so an unresolved P1 on an
+                # earlier head cannot vanish behind a clean delta. Degraded
+                # rounds keep P1 badges too: Auto-fix selects findings by badge
+                # and [BLOCKER] tag, so stripping badges would hide P1s from
+                # the batch fix as well as from the gate.
+                INVENTORY_TEXT='Return ONE comprehensive inventory of every P0/P1 in this diff, grouped by the root invariant each violates. For each finding give the affected symbol, every sibling consumer with the same defect, the failing input or call path, impact, confidence, a safe remediation path, and the regression test that would represent the class. Completeness on this pass matters more than brevity — a finding held back costs a full review generation. See "Code Review Rules" in AGENTS.md.'
+                if [ -z "${PREV_HEAD}" ]; then
+                  REQUEST_BODY=$(printf '@codex review\n\n%s\n\n<!-- %s -->' "${INVENTORY_TEXT}" "${ANCHOR}")
+                elif [ "${DEGRADED}" -eq 0 ]; then
+                  REQUEST_BODY=$(printf '@codex review\n\n%s\n\nHead %s of this pull request already has a completed review. Report the fixed/still-open status of every finding from your prior reviews, and RE-EMIT each still-open P0/P1 with its severity badge. For new findings, review the commit range %s..%s. If that range is not comparable (force-push), review the full diff.\n\n<!-- %s -->' "${INVENTORY_TEXT}" "${PREV_HEAD}" "${PREV_HEAD}" "${HEAD_SHA}" "${ANCHOR}")
+                else
+                  REQUEST_BODY=$(printf '@codex review\n\nRound %s exceeds the full-review budget for this pull request. Review ONLY the commit range %s..%s (the full diff if that range is not comparable after a force-push). Report P0 findings with their P0 badge, and RE-EMIT any still-open prior P0 likewise. Report P1s — new or still open — under a heading named Non-blocking notes, KEEPING their severity badges: they will be batch-fixed but do not hold the merge on this round.\n\n<!-- %s -->' "${ROUND}" "${PREV_HEAD}" "${HEAD_SHA}" "${ANCHOR}")
+                fi
                 # `|| true` on its own is not enough here. On a failed request
                 # gh prints the API's error body to STDOUT, so the assignment
                 # succeeds with a non-empty value that is not an id: a 403 was
@@ -373,8 +462,8 @@ jobs:
           # actually asserts that the diff was reviewed and found clean. The
           # marker test stays as a second condition: a body that both claims no
           # major issues and carries a P0/P1 badge is contradictory, and the
-          # blocking reading is the safe one.
-          CLEAN_VERDICT="Codex Review: Didn't find any major issues."
+          # blocking reading is the safe one. (CLEAN_VERDICT is defined up with
+          # the verdict patterns, where the round-state read also needs it.)
           codex_clean_comment_for_head() {
             api "repos/${REPO}/issues/${PR}/comments" \
               --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .id] | .[]" \
@@ -511,19 +600,26 @@ jobs:
 
           INLINE=0
           BODY=0
+          # ACTIVE_PATTERN, not PATTERN: on degraded rounds only P0 markers
+          # hold the merge here. P1 badges still land on the PR for the batch
+          # fix; they just stop deciding this check.
           for RID in ${RIDS}; do
             HITS=$(api "repos/${REPO}/pulls/${PR}/comments" \
               --jq ".[] | select(.pull_request_review_id == ${RID}) | .body" \
-              | count_matches "${PATTERN}")
+              | count_matches "${ACTIVE_PATTERN}")
             INLINE=$((INLINE + HITS))
             # Through api() as well: a body-only finding is the one form with no
             # inline comment to fall back on, so dropping it would lose a blocker.
             HITS=$(api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' \
-              | count_matches "${PATTERN}")
+              | count_matches "${ACTIVE_PATTERN}")
             BODY=$((BODY + HITS))
           done
 
           if [ "$((INLINE + BODY))" -gt 0 ]; then
+            if [ "${DEGRADED}" -eq 1 ]; then
+              echo "::error::Codex review reports P0 finding(s) on ${HEAD_SHA} (inline: ${INLINE}, body: ${BODY}) on degraded round ${ROUND} — P1s no longer hold the merge here, so these are P0s. Fix the invariant rather than the reported instance. A human can stop automation by applying the 'needs-human' label."
+              exit 1
+            fi
             echo "::error::Codex review reports P0/P1/[BLOCKER] finding(s) on ${HEAD_SHA} (inline: ${INLINE}, body: ${BODY}). Fix the invariant rather than the reported instance — audit every sibling consumer of the affected contract in the same batch, because each additional round costs a full review generation. A human can stop automation by applying the 'needs-human' label."
             exit 1
           fi

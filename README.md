@@ -1,10 +1,22 @@
 # codex-review-gate
 
-A merge gate that answers exactly one question: **does Codex report a
-P0/P1/[BLOCKER] on the current head commit?**
+A merge gate that answers exactly one question: **does Codex report a blocking
+finding on the current head commit?**
 
 Verdict states are PASS / BLOCK / UNKNOWN, and only PASS exits 0. Absence of a
 verdict is not approval.
+
+What counts as "blocking" narrows after the review budget is spent. The gate
+counts **completed review generations** statelessly from head-bound Codex
+verdicts (a review's `commit_id`, or a clean-summary comment naming a head —
+request anchors never count, because an anchor proves a request was posted, not
+that review completed). For the first three completed rounds any
+P0/P1/[BLOCKER] blocks; from then on only P0 blocks, while P1s are still
+reported with their badges for the batch fix. Re-review requests are scoped to
+the commit range since the last completed verdict and require still-open prior
+findings to be re-emitted with their badges, so an unresolved P1 on an earlier
+head cannot vanish behind a clean delta. UNKNOWN fails in every round — the
+budget never overrides a missing verdict.
 
 It exists as a standalone repository because a gate distributed as *content* is
 reviewed once per consumer. Copying the body into eight repositories put the
