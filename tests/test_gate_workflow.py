@@ -257,6 +257,121 @@ def test_debounce_waits_and_never_skips():
 # --------------------------------------------------------------------------
 
 
+def test_round_state_derives_from_completed_verdicts_not_anchors():
+    """An anchor proves a request was posted, not that review completed.
+
+    The gate posts its anchor BEFORE waiting, and a new push cancels the
+    pending run — so an anchored head can be entirely unreviewed. Deriving the
+    delta base or the round count from anchors would let base..old-head merge
+    unreviewed while the next round looks only at old-head..new-head. The
+    round-state block may therefore read only CODEX_BOT-authored artifacts:
+    reviews (commit_id) and clean-summary comments (full SHA in the body).
+    """
+    idx = SCRIPT.index("VERDICT_LINES=$(")
+    block = SCRIPT[idx : SCRIPT.index(")", SCRIPT.index("capture"))]
+    assert 'api "repos/${REPO}/pulls/${PR}/reviews"' in block
+    assert 'api "repos/${REPO}/issues/${PR}/comments"' in block
+    assert "CODEX_BOT" in block
+    # The anchor marker and the anchor author must play no part.
+    assert "ANCHOR" not in block
+    assert "codex-review-window head" not in block
+
+
+def test_round_state_reads_fail_closed():
+    """The round-state reads select the request text AND the blocking pattern.
+
+    A swallowed failure here would read as "round 1" — a full pattern, which is
+    the strict direction, but also a fresh full-review request that resets the
+    delta chain. More importantly the same read shape feeds ACTIVE_PATTERN, so
+    it must go through api() like every other verdict-bearing read.
+    """
+    idx = SCRIPT.index("VERDICT_LINES=$(")
+    block = SCRIPT[idx : idx + 800]
+    assert "gh api" not in block, "round-state read bypasses the api() wrapper"
+    assert block.count("api \"repos/") == 2
+
+
+def test_degraded_rounds_swap_only_the_marker_scan_pattern():
+    """ACTIVE_PATTERN defaults to the full pattern and narrows only when
+    DEGRADED, and only the count_matches scans consume it.
+
+    The clean-signal jq must keep the FULL pattern in every round: a summary
+    claiming "no major issues" while carrying any badge is contradictory, and
+    the blocking reading is the safe one.
+    """
+    assert re.search(r"^\s*ACTIVE_PATTERN=\"\$\{PATTERN\}\"", SCRIPT, re.M)
+    # Reassigned only under the DEGRADED check.
+    reassign = [
+        m.start() for m in re.finditer(r'ACTIVE_PATTERN="\$\{P0_PATTERN\}"', SCRIPT)
+    ]
+    assert len(reassign) == 1
+    guard = SCRIPT[: reassign[0]].rsplit("if ", 1)[1]
+    assert "DEGRADED" in guard
+    # Both marker scans consume ACTIVE_PATTERN; nothing else does.
+    assert SCRIPT.count('count_matches "${ACTIVE_PATTERN}"') == 2
+    assert 'count_matches "${PATTERN}"' not in SCRIPT
+    # The clean-comment filter still tests the full jq pattern.
+    clean = SCRIPT[SCRIPT.index("codex_clean_comment_for_head() {") :][:400]
+    assert "JQ_PATTERN" in clean
+
+
+def test_the_degraded_pattern_is_p0_only():
+    """[BLOCKER] is the P1 tag in this fleet's review policy.
+
+    Including it in the degraded pattern would make the degrade a no-op for
+    every prose-tagged P1; including P[01] would make it a no-op outright.
+    """
+    m = re.search(r"^\s*P0_PATTERN='([^']+)'", SCRIPT, re.M)
+    assert m, "P0_PATTERN not found"
+    pat = m.group(1)
+    assert "badge/P0" in pat
+    assert "P0 Badge" in pat
+    assert "BLOCKER" not in pat
+    assert "P[01]" not in pat
+    assert "P1" not in pat
+
+
+def test_round_one_request_text_is_unchanged():
+    """Round 1 must stay byte-compatible with runner.py's first request.
+
+    dev-agent's runner posts CODEX_INVENTORY_REQUEST when it creates a PR; the
+    gate posts the same text on round 1. The two are kept in sync deliberately,
+    and this sentence is the sync contract.
+    """
+    assert "comprehensive inventory" in SCRIPT
+    assert (
+        "Completeness on this pass matters more than brevity" in SCRIPT
+    )
+
+
+def test_followup_request_reemits_open_findings():
+    """A delta review must not let an earlier unresolved P1 vanish.
+
+    The gate scans only reviews bound to the CURRENT head, so a P1 on head A
+    followed by an unrelated clean commit B would produce a clean delta verdict
+    and merge with the P1 still open — unless every follow-up round requires
+    still-open findings to be re-emitted with their badges, where the scan sees
+    them again.
+    """
+    assert "fixed/still-open status" in SCRIPT
+    assert "RE-EMIT each still-open P0/P1 with its severity badge" in SCRIPT
+    # The range is a printf %s..%s filled from PREV_HEAD and HEAD_SHA.
+    assert "commit range %s..%s" in SCRIPT
+    assert '"${PREV_HEAD}" "${HEAD_SHA}"' in SCRIPT
+    assert "force-push" in SCRIPT
+
+
+def test_degraded_request_is_delta_and_keeps_p1_badges():
+    """Capped rounds narrow the review, without hiding P1s from Auto-fix.
+
+    Auto-fix selects findings by badge and [BLOCKER] tag. A degraded request
+    that asked for unbadged P1s would remove them from the batch fix as well as
+    from the gate — so the badges stay, and only the gate's scan pattern
+    narrows.
+    """
+    assert "exceeds the full-review budget" in SCRIPT
+    assert "Non-blocking notes" in SCRIPT
+    assert "KEEPING their severity badges" in SCRIPT
 
 
 # --------------------------------------------------------------------------
