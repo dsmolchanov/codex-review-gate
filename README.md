@@ -42,6 +42,7 @@ jobs:
   codex-review-window:
     uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@v1
     permissions:
+      actions: read   # the gate probes the waker's state to size its window
       contents: read
       issues: read
       pull-requests: write
