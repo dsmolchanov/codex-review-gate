@@ -98,8 +98,10 @@ def test_permissions_cover_every_write_the_script_makes():
     could do.
     """
     perms = JOB["permissions"]
-    # `issues: read` suffices now that the gate writes no labels.
-    assert perms["issues"] == "read"
+    # `issues: write` exists for exactly one write — the review-debt record
+    # filed when a degraded round merges over open P1s. The gate still writes
+    # no labels and never reads an issue to authorize anything.
+    assert perms["issues"] == "write"
     assert perms["pull-requests"] == "write"
     # The waker probe reads /actions/workflows/...; without `actions: read`
     # that call 403s, the probe fails soft, and the long window applies
@@ -178,9 +180,17 @@ def test_every_verdict_read_goes_through_the_failing_api_wrapper():
     # through api() would block every merge whenever this one informational
     # read hiccuped.
     WAKER_PROBE = 'gh api "repos/${REPO}/actions/workflows/codex-verdict-waker.yml"'
+    # The review-debt reads are the third permitted swallow: they run ONLY
+    # after the verdict is decided (a degraded round with zero P0s), and they
+    # feed the debt RECORD, not the merge decision. A failure there loses the
+    # bookkeeping — reported as a ::warning telling a human to file the issue
+    # by hand — and must never hold a merge the verdict already allowed.
+    DEBT_READ = 'gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}"'
     forbidden = [
         m for m in re.findall(r"gh api[^\n]*\|\| true", code)
-        if not m.startswith(IDENTITY_PROBE) and not m.startswith(WAKER_PROBE)
+        if not m.startswith(IDENTITY_PROBE)
+        and not m.startswith(WAKER_PROBE)
+        and not m.startswith(DEBT_READ)
     ]
     assert not forbidden, "verdict read swallows failures:\n" + "\n".join(forbidden)
 
@@ -210,10 +220,16 @@ def test_the_two_reads_that_decide_blockers_fail_hard():
 
     # The body scan sits inside the per-review loop, so assert on the line that
     # issues it rather than on a window after it.
+    # REVIEW_BODY= is the review-debt read — it re-reads the same endpoint
+    # AFTER the verdict is decided, to record deferred findings, and is
+    # deliberately fail-soft (see the sweep test's DEBT_READ allowlist). Only
+    # the verdict-feeding scan must fail hard.
     body_lines = [
         ln
         for ln in SCRIPT.splitlines()
-        if "reviews/${RID}" in ln and not ln.lstrip().startswith("#")
+        if "reviews/${RID}" in ln
+        and not ln.lstrip().startswith("#")
+        and "REVIEW_BODY=" not in ln
     ]
     assert body_lines, "the review-body scan disappeared"
     for line in body_lines:
@@ -573,3 +589,21 @@ def test_the_no_verdict_error_does_not_prescribe_a_reflex_rerun():
     assert "automatically" in msg
     assert "reaction" in msg
     assert "wait rather than pushing a commit" in msg
+
+
+def test_degraded_p0_alerts_a_human():
+    """A P0 stuck past the review budget is a dead end by design.
+
+    No further round will soften it and no automation may bypass it, so the
+    state is announced the way the quota outage is — otherwise the only symptom
+    is a red check nobody is watching, which is how the quota state once went
+    unnoticed for three days.
+    """
+    marker = "carries a P0 past the review budget"
+    assert marker in SCRIPT, "the degraded-P0 alert disappeared"
+    branch = SCRIPT[SCRIPT.index(marker) - 1200 : SCRIPT.index(marker) + 800]
+    assert "SLACK_WEBHOOK" in branch
+    # And it must still exit 1 — the alert is in addition to holding the
+    # merge, never instead of it.
+    after = SCRIPT[SCRIPT.index(marker) :]
+    assert re.search(r"^\s*exit 1\s*$", after, re.M)

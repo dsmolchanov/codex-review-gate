@@ -876,3 +876,127 @@ def test_probe_failure_falls_back_to_the_long_window(tmp_path):
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# Review debt: a degraded round that merges over P1s must record them.
+#
+# A finding that blocks nothing and is recorded nowhere is a finding deleted —
+# the PR closes and the threads fall out of every queue. These tests pin the
+# whole contract: the issue is filed exactly when P1s defer (never on full
+# rounds, never on a clean head), it deduplicates by title, and its failure
+# costs the record, never the merge.
+# --------------------------------------------------------------------------
+
+
+def issue_posts(tmp_path):
+    """The bodies of POSTs to the repo-level issues endpoint (creation only)."""
+    calls = posted_bodies(tmp_path)
+    return [
+        line
+        for line in calls.splitlines()
+        if "issues -f title=" in line.replace("repos/owner/repo/", "")
+        or ("repos/owner/repo/issues " in line and "-f" in line)
+    ]
+
+
+def test_deferred_p1s_merge_and_are_filed_as_review_debt(tmp_path):
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert "Review debt: PR #7" in calls, "the deferred P1 was not filed"
+    assert "review-debt issue" in result.stdout
+
+
+def test_review_debt_carries_the_finding_and_the_policy(tmp_path):
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "exceeded the review budget" in calls
+    assert HEAD in calls, "the debt record does not name the merged head"
+
+
+def test_no_debt_issue_on_a_full_round(tmp_path):
+    """On rounds 1-3 a P1 blocks; filing debt there would double-report."""
+    fx = round_fixture(OLD1, OLD2, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0
+    assert "Review debt:" not in posted_bodies(tmp_path)
+
+
+def test_no_debt_issue_on_a_clean_degraded_round(tmp_path):
+    """No findings, nothing to record — the exit 0 stays quiet."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {"*": ""}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "Review debt:" not in posted_bodies(tmp_path)
+
+
+def test_degraded_p0_blocks_and_files_no_debt(tmp_path):
+    """A P0 holds the merge; the debt record is only for what merged over."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P0_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0
+    assert "Review debt:" not in posted_bodies(tmp_path)
+
+
+def test_debt_appends_to_an_existing_issue(tmp_path):
+    """One issue per PR: a later degraded round comments, never duplicates."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    # The open-issues listing returns an existing debt issue, number 42.
+    fx["routes"]["issues?state=open"] = {"select(.title ==": "42", "*": ""}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert "issues/42/comments" in calls, "did not append to the existing issue"
+    assert "review-debt issue #42" in result.stdout
+
+
+def test_debt_filing_failure_never_holds_the_merge_and_never_duplicates(tmp_path):
+    """The merge decision precedes the bookkeeping; a 403 costs the record.
+
+    And when the DEDUP lookup is what failed, the gate must write NOTHING: an
+    empty lookup result born from an error is indistinguishable from "no issue
+    yet", and creating on it would duplicate the per-PR debt issue — the
+    one-issue contract broken by the very mechanism meant to keep it.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    fx["routes"]["issues?state=open"] = "__FAIL__"
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, (
+        f"a bookkeeping failure held a merge the verdict allowed:\n{result.stdout}\n{result.stderr}"
+    )
+    calls = posted_bodies(tmp_path)
+    # The dedup lookup's --jq text legitimately names the title; what must be
+    # absent is any WRITE — the creation's `-f title=` or an append to a
+    # comments endpoint with a body.
+    assert "-f title=" not in calls, (
+        f"a failed dedup lookup created a possibly-duplicate issue:\n{calls}"
+    )
+    assert "writing nothing rather than risking a duplicate" in result.stdout

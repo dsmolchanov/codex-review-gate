@@ -44,7 +44,7 @@ jobs:
     permissions:
       actions: read   # the gate probes the waker's state to size its window
       contents: read
-      issues: read
+      issues: write   # the review-debt record a degraded round files before merging
       pull-requests: write
     secrets:
       CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
