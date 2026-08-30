@@ -75,10 +75,10 @@ jobs:
       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
       contains(github.event.comment.body, 'Codex Review')
     runs-on: ubuntu-latest
-    # This job does three API reads and at most one write. If it is not done in
-    # two minutes something is wrong, and a waker that hangs would reintroduce
-    # exactly the cost this change removes.
-    timeout-minutes: 5
+    # A few API reads, at most one bounded wait on an in-flight gate run
+    # (WAKER_RECHECK_SECONDS, 240s), and at most one write. A waker that could
+    # hang would reintroduce exactly the cost this design removes.
+    timeout-minutes: 6
     permissions:
       # `actions: write` is the whole point — it is what allows the re-run.
       # `pull-requests: read` reads the head SHA. Nothing else: this workflow
@@ -130,11 +130,36 @@ jobs:
           if [ -z "${TARGET}" ]; then
             RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
             if [ "${RUNNING}" -gt 0 ]; then
-              echo "A gate run for ${HEAD_SHA} is still in flight; it will see this verdict itself. Nothing to wake."
-            else
-              echo "No completed, non-green gate run for ${HEAD_SHA}. Either the gate is already green or the head has moved on and its own run decides. Nothing to wake."
+              # An in-flight run USUALLY sees the comment itself — its verdict
+              # poll is still cycling — but not always: a comment landing after
+              # the run's deadline expired, while it walks its no-verdict exit
+              # path, is invisible to it, and once it fails there is no later
+              # event to wake it. That interleaving is narrow (the exit path is
+              # a few API calls) but it strands the PR red when it hits. One
+              # bounded re-check covers it: wait out the in-flight run and
+              # re-run it only if it failed. The wait is capped by the gate's
+              # own short lifetime — window (120s) + grace (90s) + settle (15s)
+              # — and costs nothing in the common case where the gate goes
+              # green on its own (TARGET stays empty and this exits quietly).
+              echo "A gate run for ${HEAD_SHA} is still in flight; waiting for it rather than racing it."
+              RECHECK_DEADLINE=$((SECONDS + ${WAKER_RECHECK_SECONDS:-240}))
+              while :; do
+                sleep 15
+                RUN_JSON=$(gh api                   "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100"                   --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
+                RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
+                [ "${RUNNING}" -eq 0 ] && break
+                if [ ${SECONDS} -ge ${RECHECK_DEADLINE} ]; then
+                  echo "Gate run still in flight after the re-check budget; it outlives this waker and decides for itself."
+                  exit 0
+                fi
+              done
+              TARGET=$(printf '%s' "${RUN_JSON}"                 | jq -r 'map(select(.status == "completed" and .conclusion != "success"))
+                         | if length == 0 then "" else .[0].id end')
             fi
-            exit 0
+            if [ -z "${TARGET}" ]; then
+              echo "No completed, non-green gate run for ${HEAD_SHA}. Either the gate is already green or the head has moved on and its own run decides. Nothing to wake."
+              exit 0
+            fi
           fi
 
           echo "Re-running gate run ${TARGET} so it re-reads the verdict for ${HEAD_SHA}."

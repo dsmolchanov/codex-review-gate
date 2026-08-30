@@ -85,5 +85,15 @@ def test_waker_leaves_drafts_and_closed_prs_alone():
 
 
 def test_waker_cannot_hang_a_runner():
-    """A hung waker re-creates the very cost this design removes."""
-    assert JOB["timeout-minutes"] <= 5
+    """A hung waker re-creates the very cost this design removes.
+
+    The one wait it is allowed is the bounded re-check on an in-flight gate run,
+    capped by WAKER_RECHECK_SECONDS at 240s — sized to the gate's own maximum
+    lifetime (window 120s + grace 90s + settle 15s), because waiting any longer
+    means the thing being waited on is not the gate. The job timeout leaves
+    headroom over that cap and nothing more.
+    """
+    assert JOB["timeout-minutes"] <= 6
+    m = re.search(r"WAKER_RECHECK_SECONDS:-(\d+)", SCRIPT)
+    assert m, "the in-flight re-check lost its bound"
+    assert int(m.group(1)) <= 240
