@@ -28,6 +28,21 @@ on:
 # earlier revision self-cancelling.
 # https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment
 #
+# That absence is what `codex-verdict-waker.yml` exists to work around, and the
+# workaround is deliberately NOT "listen to issue_comment here". The waker is a
+# SEPARATE workflow that is not a required check and holds its own concurrency
+# group, so neither problem above applies to it; when a Codex comment lands it
+# RE-RUNS this workflow's PR-bound run, which reports against the PR head and
+# therefore does satisfy the required check. Both defects are avoided by never
+# letting a comment event be the thing that reports the verdict.
+#
+# Why that indirection is worth a second file: Codex delivers most clean
+# verdicts as a summary COMMENT, not as a formal review. Over one day of fleet
+# traffic, 15 of 17 green gate runs passed on the comment path and only 2 on a
+# formal review. A design that re-entered on `pull_request_review` alone would
+# therefore leave ~88% of clean pull requests red until someone re-ran the job
+# by hand.
+#
 # The job key below MUST match the required-status-check name in branch
 # protection. GitHub matches required checks against the job key (or the
 # reported check-run name), NOT a custom display name. Do not add `name:`
@@ -162,6 +177,8 @@ jobs:
       # depends on Codex Automatic Reviews, which fire on open/ready only.
       CODEX_REQUEST_TOKEN: ${{ secrets.CODEX_REQUEST_TOKEN }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # Lets the debounce below tell a first run from a waker-driven re-run.
+      RUN_ATTEMPT: ${{ github.run_attempt }}
       # Quiet interval before the verdict lookup, so a burst of checkpoint pushes
       # costs one review generation instead of one each.
       DEBOUNCE_SECONDS: "90"
@@ -249,7 +266,16 @@ jobs:
           # check SATISFIES branch protection and no later event would wake a
           # deferred one.
           # ---------------------------------------------------------------
-          if [ "${ACTION}" = "synchronize" ] && [ "${DEBOUNCE_SECONDS}" -gt 0 ]; then
+          # A RE-RUN is never part of a push burst — it is the waker answering a
+          # verdict that just landed, or a human retrying. Debouncing it would
+          # pay 90 more seconds of runner time to re-read a head that this run
+          # already read fresh from the API two lines above, and would delay the
+          # answer the waker exists to deliver. The superseded-head check the
+          # debounce also performs is not lost: with no sleep there is no window
+          # for the head to move within, and HEAD_SHA is re-read on every run.
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ]; then
+            echo "Run attempt ${RUN_ATTEMPT}: skipping the debounce (a re-run is not a burst of pushes)."
+          elif [ "${ACTION}" = "synchronize" ] && [ "${DEBOUNCE_SECONDS}" -gt 0 ]; then
             echo "Debouncing ${DEBOUNCE_SECONDS}s so a burst of pushes costs one review generation."
             sleep "${DEBOUNCE_SECONDS}"
             HEAD_NOW=$(api "repos/${REPO}/pulls/${PR}" --jq '.head.sha')
@@ -495,7 +521,36 @@ jobs:
             echo 0
           }
 
-          WINDOW="${VERDICT_WINDOW_SECONDS:-900}"
+          # ---------------------------------------------------------------
+          # SHORT window, not a long one. A runner is billed for every second
+          # it is held, and a 900s window spent in `sleep 20` was 424 billed
+          # minutes across four repositories in a single day — 263 of them in
+          # runs that `cancel-in-progress` killed mid-sleep, so the wait was
+          # paid for and then thrown away.
+          #
+          # The window no longer has to cover Codex's whole turnaround, because
+          # a verdict that arrives after it now RE-ENTERS the gate instead of
+          # having to be caught by a poll that was already running:
+          #   * a formal review fires `pull_request_review: submitted`, which
+          #     this workflow already listens to (see the header);
+          #   * a clean-summary comment fires `issue_comment`, which this
+          #     workflow deliberately CANNOT listen to — a comment event runs
+          #     from the default branch, so its check run is bound to the wrong
+          #     SHA and can never satisfy the PR's required check. The waker in
+          #     `codex-verdict-waker.yml` listens instead and RE-RUNS the
+          #     PR-bound run for this head, which reports against the right SHA.
+          #
+          # So the window covers only the fast path — a verdict already in hand,
+          # or one landing within a couple of minutes — and everything slower is
+          # handled by re-entry. It is still a real wait, not zero: exiting
+          # instantly would fail the check on every push and make the PR flap red
+          # before the waker could answer.
+          #
+          # What re-entry does NOT cover is a bare 👍 REACTION, because reactions
+          # fire no webhook event of any kind. A reaction-only verdict landing
+          # after this window needs a manual re-run, and the no-verdict error
+          # below says so.
+          WINDOW="${VERDICT_WINDOW_SECONDS:-120}"
           DEADLINE=$((SECONDS + WINDOW))
           RIDS=""
           CLEAN=0
@@ -546,10 +601,18 @@ jobs:
               echo "::notice::Codex holds a PR-level 👍, but a reaction carries no commit id and cannot be attributed to ${HEAD_SHA}, so it is not accepted as this head's verdict. Re-run this job once Codex answers for this commit."
             fi
             if [ "${ANCHOR_FAILED}" -eq 1 ]; then
-              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR and re-run this job."
+              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR; the verdict will re-enter this gate on its own."
               exit 1
             fi
-            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. Re-run this job once Codex has answered; if the repo is genuinely not connected to Codex Cloud, disconnect this required check in branch protection rather than opening a repo-wide bypass here."
+            # NOT "re-run this job once Codex has answered" any more. This window
+            # is deliberately short (see WINDOW above) and re-entry is automatic:
+            # a formal review fires `pull_request_review`, and a clean-summary
+            # comment is picked up by the waker, which re-runs this exact run.
+            # Telling an operator to poll and re-run by hand would describe work
+            # the fleet now does itself — and, worse, would train them to re-run
+            # a red gate reflexively, which is how a genuine BLOCK gets retried
+            # until it flakes green.
+            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. This is EXPECTED while Codex is still reviewing: a review or a clean summary re-opens this gate automatically, so wait rather than pushing a commit to shake a verdict loose. Two cases do need a hand: a verdict delivered ONLY as a 👍 reaction (reactions fire no event, so nothing can re-enter — re-run this job), and a repo genuinely not connected to Codex Cloud (disconnect this required check in branch protection rather than opening a repo-wide bypass here)."
             exit 1
           fi
 

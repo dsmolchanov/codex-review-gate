@@ -18,4 +18,4 @@ jobs:
       - name: Actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint .github/workflows/codex-review-window.yml .github/workflows/ci.yml
+          ./actionlint .github/workflows/codex-review-window.yml .github/workflows/codex-verdict-waker.yml .github/workflows/ci.yml
