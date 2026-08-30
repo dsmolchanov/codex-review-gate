@@ -132,7 +132,14 @@ jobs:
       # call needs its scope spelled out. Reading the head commit's timestamp
       # needs `contents`; the 👍 verdict lives on the issue-side reactions
       # endpoint; posting the review-request anchor needs `pull-requests: write`.
-      # No `issues: write` — this gate writes no labels.
+      # `issues: write` exists for exactly one write: the review-debt record.
+      # On a round past the review budget the gate merges over open P1s, and a
+      # finding that blocks nothing and is recorded nowhere is a finding
+      # deleted — so the gate files ONE issue carrying the deferred findings
+      # before it exits 0. It still writes no labels, posts no other issue,
+      # and never reads an issue to AUTHORIZE anything (see the header: a
+      # GITHUB_TOKEN comment cannot be attributed to a workflow, so nothing
+      # here trusts one).
       #
       # `actions: read` exists for exactly one call: the waker probe, which asks
       # /actions/workflows/... for the waker's state to decide the verdict
@@ -144,7 +151,7 @@ jobs:
       # workflow's permissions cannot exceed its caller's.
       actions: read
       contents: read
-      issues: read
+      issues: write
       pull-requests: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -724,6 +731,19 @@ jobs:
 
           if [ "$((INLINE + BODY))" -gt 0 ]; then
             if [ "${DEGRADED}" -eq 1 ]; then
+              # A P0 stuck past the review budget is not routine red: the PR
+              # has burned its rounds and is now held on a data-loss-class
+              # finding — say it where a human looks, the same way the quota
+              # outage is announced. Alert failure changes nothing: the exit 1
+              # below already holds the merge.
+              HOOK=$(printf '%s' "${SLACK_WEBHOOK}" | tr -d '[:space:]')
+              if [ -n "${HOOK}" ]; then
+                CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+                  -H 'Content-type: application/json' \
+                  --data "$(jq -nc --arg text "🛑 PR #${PR} (${HEAD_SHA}) carries a P0 past the review budget (round ${ROUND}) — the merge is held and no further round will soften it. A human decision is needed: ${RUN_URL}" '{text: $text}')" \
+                  "${HOOK}") || CODE="curl-error"
+                echo "Slack responded: ${CODE}"
+              fi
               echo "::error::Codex review reports P0 finding(s) on ${HEAD_SHA} (inline: ${INLINE}, body: ${BODY}) on degraded round ${ROUND} — P1s no longer hold the merge here, so these are P0s. Fix the invariant rather than the reported instance. A human can stop automation by applying the 'needs-human' label."
               exit 1
             fi
@@ -732,7 +752,61 @@ jobs:
           fi
 
           # ---------------------------------------------------------------
-          # Deliberate bypass 2 of 2: a head-bound review with no P0/P1 marker.
+          # Review debt. On a degraded round the scan above counted only P0s,
+          # so reaching here can mean "no findings at all" or "P1s that no
+          # longer block". The second case merges a PR with findings open, and
+          # a finding that blocks nothing and is recorded NOWHERE is a finding
+          # deleted — the PR closes, the threads fall out of every queue, and
+          # the debt silently becomes permanent. So before the exit 0, re-scan
+          # with the FULL pattern and file the deferred findings as ONE issue.
+          #
+          # Fail-soft throughout, and deliberately NOT through api(): the
+          # merge decision is already made — P0s were counted above and there
+          # are none — so a failure here may cost the record, never the merge.
+          # Holding the PR red because a bookkeeping write hiccuped would
+          # reintroduce the exact cost the round budget exists to cap. The
+          # fail-hard sweep test allowlists these reads by the same reasoning
+          # as the identity and waker probes: they feed no verdict.
+          # ---------------------------------------------------------------
+          if [ "${DEGRADED}" -eq 1 ] && [ -n "${RIDS}" ]; then
+            DEBT=""
+            for RID in ${RIDS}; do
+              INLINE_DEBT=$(gh api --paginate "repos/${REPO}/pulls/${PR}/comments" \
+                --jq ".[] | select(.pull_request_review_id == ${RID}) | select(.body | test(\"${JQ_PATTERN}\")) | \"- [\" + .path + \"] \" + (.body | split(\"\\n\")[0])" \
+                2>/dev/null || true)
+              DEBT="${DEBT}${INLINE_DEBT}"$'\n'
+              REVIEW_BODY=$(gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}" --jq '.body' 2>/dev/null || true)
+              if printf '%s' "${REVIEW_BODY}" | grep -qE "${PATTERN}"; then
+                BODY_DEBT=$(printf '%s' "${REVIEW_BODY}" | grep -E "${PATTERN}" | head -1)
+                DEBT="${DEBT}- [review body] ${BODY_DEBT}"$'\n'
+              fi
+            done
+            if printf '%s' "${DEBT}" | grep -q '\S'; then
+              DEBT_TITLE="Review debt: PR #${PR} — findings deferred after the review budget"
+              DEBT_BODY=$(printf 'Round %s of PR #%s exceeded the review budget (%s full rounds), so these still-open findings no longer hold the merge and the PR merged over them. They are recorded here so the debt survives the PR.\n\nHead: %s\n\n%s\n\nFix the invariant, not the instance — see AGENTS.md.' \
+                "${ROUND}" "${PR}" "${FULL_ROUNDS}" "${HEAD_SHA}" "${DEBT}")
+              # One issue per PR, found by its exact title: a later degraded
+              # round on the same PR appends a comment instead of filing a
+              # duplicate.
+              DEBT_ID=$(gh api --paginate "repos/${REPO}/issues?state=open&per_page=100" \
+                --jq ".[] | select(.pull_request == null) | select(.title == \"${DEBT_TITLE}\") | .number" \
+                2>/dev/null | head -1 || true)
+              if [ -n "${DEBT_ID}" ]; then
+                gh api "repos/${REPO}/issues/${DEBT_ID}/comments" -f body="${DEBT_BODY}" >/dev/null 2>&1 \
+                  && echo "Appended the deferred findings for ${HEAD_SHORT} to review-debt issue #${DEBT_ID}." \
+                  || echo "::warning::Could not append to review-debt issue #${DEBT_ID}; the findings above merge unrecorded. File them by hand."
+              else
+                gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="${DEBT_BODY}" >/dev/null 2>&1 \
+                  && echo "Filed the deferred findings as a review-debt issue." \
+                  || echo "::warning::Could not file the review-debt issue; the findings above merge unrecorded. File them by hand."
+              fi
+            fi
+          fi
+
+          # ---------------------------------------------------------------
+          # Deliberate bypass 2 of 2: a head-bound review with no BLOCKING
+          # marker — P0/P1 on full rounds, P0 only once the budget is spent
+          # (with the P1s just recorded as review debt above).
           # ---------------------------------------------------------------
           echo "Codex review is green for ${HEAD_SHA}."
           exit 0
