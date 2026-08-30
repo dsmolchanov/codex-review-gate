@@ -550,7 +550,32 @@ jobs:
           # fire no webhook event of any kind. A reaction-only verdict landing
           # after this window needs a manual re-run, and the no-verdict error
           # below says so.
-          WINDOW="${VERDICT_WINDOW_SECONDS:-120}"
+          #
+          # THE SHORT WINDOW IS EARNED, NOT ASSUMED. An `issue_comment` workflow
+          # runs only when its file exists on the DEFAULT branch — so on the very
+          # pull request that installs the waker (and on every repository whose
+          # bootstrap PR ships both stubs together), the waker cannot fire yet.
+          # Shortening the window there strands a comment-shaped verdict with
+          # nothing to re-enter the gate. So the gate checks whether the waker
+          # is deployed where events can actually reach it, and keeps the old
+          # long window until it is. Failure direction: if this probe errors
+          # (rate limit, outage), the gate assumes NO waker and takes the long
+          # window — the pre-waker behaviour that was merely expensive, never
+          # unsafe. That is why this read deliberately does NOT go through the
+          # fail-hard api() wrapper: it selects a wait length, not a verdict.
+          WAKER_PATH=".github/workflows/codex-verdict-waker.yml"
+          DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch' 2>/dev/null || true)
+          WAKER_DEPLOYED=0
+          if [ -n "${DEFAULT_BRANCH}" ]              && gh api "repos/${REPO}/contents/${WAKER_PATH}?ref=${DEFAULT_BRANCH}"                   --jq '.path' >/dev/null 2>&1; then
+            WAKER_DEPLOYED=1
+          fi
+          if [ "${WAKER_DEPLOYED}" -eq 1 ]; then
+            WINDOW="${VERDICT_WINDOW_SECONDS:-120}"
+            echo "The verdict waker is deployed on ${DEFAULT_BRANCH}; late verdicts re-enter, so the in-run window is ${WINDOW}s."
+          else
+            WINDOW="${VERDICT_WINDOW_SECONDS:-900}"
+            echo "No verdict waker on ${DEFAULT_BRANCH:-the default branch} — a comment-shaped verdict cannot re-enter the gate, so the in-run window stays ${WINDOW}s. Merging the waker stub shortens it."
+          fi
           DEADLINE=$((SECONDS + WINDOW))
           RIDS=""
           CLEAN=0

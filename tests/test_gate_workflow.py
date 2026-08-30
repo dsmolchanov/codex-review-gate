@@ -166,9 +166,16 @@ def test_every_verdict_read_goes_through_the_failing_api_wrapper():
     # rather than falling back to the bot identity. Anything else swallowing a
     # failure is the bug this test exists for.
     IDENTITY_PROBE = "gh api user"
+    # The waker probe is the second permitted swallow: it selects a WAIT LENGTH,
+    # not a verdict. On any failure DEFAULT_BRANCH comes back empty, the guard
+    # reads that as "no waker", and the gate takes the LONG window — the
+    # pre-waker behaviour that was merely expensive, never unsafe. Routing it
+    # through api() would block every merge whenever this one informational
+    # read hiccuped.
+    WAKER_PROBE = 'gh api "repos/${REPO}" --jq \'.default_branch\''
     forbidden = [
         m for m in re.findall(r"gh api[^\n]*\|\| true", code)
-        if not m.startswith(IDENTITY_PROBE)
+        if not m.startswith(IDENTITY_PROBE) and not m.startswith(WAKER_PROBE)
     ]
     assert not forbidden, "verdict read swallows failures:\n" + "\n".join(forbidden)
 
@@ -480,27 +487,50 @@ def test_a_broken_request_token_fails_closed():
 # --------------------------------------------------------------------------
 
 
-def test_the_verdict_window_stays_short():
-    """Re-entry, not a longer sleep, is how a slow verdict is caught.
+def test_the_short_window_is_earned_by_a_deployed_waker():
+    """Re-entry, not a longer sleep, is how a slow verdict is caught — but only
+    where re-entry can actually happen.
 
-    Widening this back out is the obvious-looking remedy for a verdict that
-    arrived late, and it is the wrong one: `codex-verdict-waker.yml` re-runs the
+    An `issue_comment` workflow runs only from the DEFAULT branch, so on the
+    pull request that installs the waker (and in any repository that has not
+    merged it) a comment-shaped verdict cannot re-enter the gate. The gate
+    therefore probes for the waker on the default branch and takes the short
+    window only when it is deployed; otherwise it keeps the long pre-waker
+    window, which was merely expensive, never unsafe.
+
+    Widening the SHORT window back out is the obvious-looking remedy for a
+    verdict that arrived late, and it is the wrong one: the waker re-runs the
     gate when a Codex summary comment lands, and `pull_request_review` re-runs
-    it when a formal review lands. Both re-enter for free. Seconds spent here
-    are paid for on every push whether or not they are needed.
+    it when a formal review lands. Both re-enter for free. Seconds spent in-run
+    are paid on every push whether or not they are needed.
     """
-    m = re.search(r'WINDOW="\$\{VERDICT_WINDOW_SECONDS:-(\d+)\}"', SCRIPT)
-    assert m, "the verdict window default was not found"
-    window = int(m.group(1))
-    assert window <= 300, (
-        f"the verdict window is {window}s. A long in-run wait is billed runner "
-        "time; catch late verdicts by re-entry (the waker, or pull_request_review)."
+    windows = re.findall(r'WINDOW="\$\{VERDICT_WINDOW_SECONDS:-(\d+)\}"', SCRIPT)
+    assert len(windows) == 2, f"expected a deployed and a fallback window, got {windows}"
+    short, long_ = int(windows[0]), int(windows[1])
+    assert 0 < short <= 300, (
+        f"the deployed-waker window is {short}s. A long in-run wait is billed "
+        "runner time; catch late verdicts by re-entry."
     )
     # Not zero either. Exiting instantly would fail the check on every push and
     # flap the PR red before any re-entry could answer, and the loop's
     # check-at-least-once shape exists precisely because a zero window once made
     # the gate report "Codex never answered" without asking.
-    assert window > 0
+    assert long_ >= 600, (
+        f"the no-waker fallback window is {long_}s; without re-entry the window "
+        "must cover Codex's real turnaround, as it always did"
+    )
+    # The short window must be the guarded branch, not the unconditional one.
+    guard = SCRIPT[SCRIPT.index('if [ "${WAKER_DEPLOYED}" -eq 1 ]') :]
+    assert guard.index(f":-{short}") < guard.index(f":-{long_}")
+    # The probe itself must fail toward the long window: a gh error selecting a
+    # wait length must not hold the merge, so it must NOT use the fail-hard
+    # api() wrapper.
+    probe_start = SCRIPT.index("WAKER_PATH=")
+    probe = SCRIPT[probe_start : SCRIPT.index("DEADLINE=$((SECONDS + WINDOW))")]
+    assert not re.search(r'(?<!gh )api "repos/\$\{REPO\}', probe), (
+        "the waker probe uses the fail-hard wrapper; an outage would block the "
+        "merge over a wait-length decision"
+    )
 
 
 def test_a_rerun_does_not_pay_the_debounce():
