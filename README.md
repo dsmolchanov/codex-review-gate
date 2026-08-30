@@ -50,6 +50,38 @@ jobs:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 ```
 
+**And** — not optional — the waker, in a second file. The gate waits only 120
+seconds for a verdict and then fails closed; a Codex verdict that arrives later
+re-opens the gate through events, and the clean-summary **comment** (how most
+clean verdicts arrive) only reaches the gate through this stub. A repository
+that installs the gate without the waker leaves every clean pull request red
+until someone re-runs the check by hand.
+
+```yaml
+name: codex-verdict-waker
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: codex-verdict-waker-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  wake:
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-verdict-waker.yml@<same pin as the gate>
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+```
+
+`issue_comment` must be declared in the consumer — the event fires in the
+repository where the comment lands. `actions: write` is what permits the
+re-run; the waker decides nothing, posts nothing, and needs no secrets. Pin
+both stubs to the **same commit** of this repository: the gate's short window
+and the waker's re-entry are two halves of one protocol.
+
 ### The required status check is named `codex-review-window / codex-review-window`
 
 A reusable workflow reports as `<caller job> / <called job>`. Branch protection
@@ -63,6 +95,10 @@ workflow declaring the same group as its caller enters a group the caller
 already holds and, with `cancel-in-progress`, cancels it — the run ends
 `failure` with zero jobs and no annotation, which reads as an invalid workflow
 file. `actionlint` does not catch it.
+
+The waker's group must also stay distinct from the gate's: keyed on its own
+name, it collapses a burst of Codex comments into one wake. Sharing the gate's
+group would cancel the very run the waker exists to re-run.
 
 ### `CODEX_REQUEST_TOKEN`
 
