@@ -607,3 +607,41 @@ def test_degraded_p0_alerts_a_human():
     # merge, never instead of it.
     after = SCRIPT[SCRIPT.index(marker) :]
     assert re.search(r"^\s*exit 1\s*$", after, re.M)
+
+
+def test_the_severity_lane_lives_in_this_pinned_workflow():
+    """Neither a caller input nor a repository variable may set the lane.
+
+    A `pull_request` run executes the PULL REQUEST's copy of the caller, so an
+    input lets the very diff whose P1 should hold the merge declare that P1
+    non-blocking. A repository VARIABLE is barely better: GitHub requires only
+    `write` access to create one (admin is required for ENVIRONMENT variables,
+    not repository ones), so a contributor can do the same one step removed.
+    Both keep the trusted `uses:` target and the required-check name intact,
+    which is exactly what makes them dangerous. The list therefore lives in
+    this file, which every caller pins by commit SHA.
+    """
+    assert "inputs" not in ON["workflow_call"], (
+        "a caller input can weaken this gate from inside a pull request"
+    )
+    assert "vars." not in RAW, "a repository variable is write-access, not policy"
+    assert "FULL_ROUNDS" not in JOB["env"], (
+        "the budget must not be settable from outside this workflow"
+    )
+    # The lane is a case over the repository, next to the budget it sets.
+    idx = SCRIPT.index("THE SEVERITY LANE LIVES HERE")
+    window = SCRIPT[idx : idx + 1600]
+    assert 'case "${REPO}" in' in window
+    assert "FULL_ROUNDS=0" in window
+    assert 'FULL_ROUNDS="${FULL_ROUNDS:-3}"' in window
+
+
+def test_an_unparseable_budget_holds_the_merge():
+    """The budget decides which severities can merge, so a malformed value
+    must stop the gate rather than fall back to a default."""
+    idx = SCRIPT.index('FULL_ROUNDS="${FULL_ROUNDS:-3}"')
+    window = SCRIPT[idx : idx + 900]
+    assert "*[!0-9]*" in window
+    assert "::error::" in window
+    assert re.search(r"^\s*exit 1\s*$", window, re.M)
+

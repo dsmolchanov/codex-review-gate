@@ -385,9 +385,42 @@ jobs:
           REVIEWED_COUNT=$(printf '%s' "${PRIOR_HEADS}" | grep -c . || [ $? -eq 1 ])
           PREV_HEAD=$(printf '%s\n' "${PRIOR_HEADS}" | tail -1)
           ROUND=$((REVIEWED_COUNT + 1))
-          # Overridable the same way as VERDICT_WINDOW_SECONDS: an undeclared
-          # env var, not a workflow input — a consumer stub cannot loosen it.
-          FULL_ROUNDS="${FULL_ROUNDS:-3}"
+          # THE SEVERITY LANE LIVES HERE, IN THE PINNED WORKFLOW.
+          #
+          # Not in a caller input, and not in a repository variable. A
+          # `pull_request` run executes the PULL REQUEST's copy of the caller,
+          # so an input lets the very pull request whose P1 should hold the
+          # merge declare that P1 non-blocking; and a repository VARIABLE is
+          # writable with `write` access — GitHub requires admin only for
+          # environment variables — so a contributor could do the same one
+          # step removed. Both wear the trusted `uses:` target and the
+          # unchanged required-check name, which is what makes them dangerous.
+          #
+          # Consumers on the fast review lane are listed here because this
+          # file is pinned by commit SHA in every caller: changing the list is
+          # a reviewed change to a trusted artifact, and a consumer adopts it
+          # by bumping its pin — which is itself the review. That is the same
+          # answer this gate reached for the `fast-merge` topic and the waiver
+          # command: an opt-out needs an identity a pull request cannot forge.
+          case "${REPO}" in
+            dsmolchanov/abrolia|dsmolchanov/NeoMenu|dsmolchanov/hermes)
+              # Fast lane: every round is P0-only. P1 findings still post with
+              # their badges and are batch-fixed; they do not hold a merge.
+              FULL_ROUNDS=0
+              ;;
+            *)
+              # VERDICT_WINDOW_SECONDS-style override: an undeclared env var
+              # the test harness sets. A caller cannot reach it — a called
+              # workflow does not inherit its caller's env.
+              FULL_ROUNDS="${FULL_ROUNDS:-3}"
+              ;;
+          esac
+          case "${FULL_ROUNDS}" in
+            ''|*[!0-9]*)
+              echo "::error::FULL_ROUNDS must be a non-negative integer, got '${FULL_ROUNDS}'. The verdict for ${HEAD_SHA} is UNKNOWN, so the gate holds the merge."
+              exit 1
+              ;;
+          esac
           DEGRADED=0
           if [ "${REVIEWED_COUNT}" -ge "${FULL_ROUNDS}" ]; then
             DEGRADED=1

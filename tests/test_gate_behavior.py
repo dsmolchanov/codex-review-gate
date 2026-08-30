@@ -140,6 +140,8 @@ def run_gate(
     request_token: str = "pat-for-tests",
     debounce: str = "0",
     run_attempt: str = "1",
+    full_rounds: str | None = None,
+    repo: str = "owner/repo",
 ):
     """Execute the gate's run: block with a stubbed gh; return CompletedProcess."""
     # A unique subdir per call, so one test can run the gate more than once.
@@ -164,7 +166,7 @@ def run_gate(
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "GH_FIXTURE": str(fixture_path),
         "GH_CALLS": str(calls),
-        "REPO": "owner/repo",
+        "REPO": repo,
         "PR": "7",
         "CODEX_BOT": BOT,
         "ACTION": action,
@@ -190,6 +192,8 @@ def run_gate(
         # that a late review is caught.
         "GRACE_SECONDS": grace,
     }
+    if full_rounds is not None:
+        env["FULL_ROUNDS"] = full_rounds
     return subprocess.run(
         ["bash", str(script)], env=env, capture_output=True, text=True, timeout=120
     )
@@ -1000,3 +1004,65 @@ def test_debt_filing_failure_never_holds_the_merge_and_never_duplicates(tmp_path
         f"a failed dedup lookup created a possibly-duplicate issue:\n{calls}"
     )
     assert "writing nothing rather than risking a duplicate" in result.stdout
+
+
+def test_a_fast_lane_repository_runs_every_round_p0_only(tmp_path):
+    """The fast lane's floor: with the repository variable at 0 the FIRST
+    round is already degraded, so a P1 never holds the merge there."""
+    fx = clean_fixture()
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx, repo="dsmolchanov/NeoMenu")
+    assert "Degraded round 1" in result.stdout, result.stdout
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+def test_a_fast_lane_repository_still_blocks_p0(tmp_path):
+    """A floor that does not stop a P0 is not a floor."""
+    fx = clean_fixture()
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P0_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx, repo="dsmolchanov/NeoMenu")
+    assert result.returncode != 0, result.stdout
+
+
+def test_a_fast_lane_repository_still_fails_closed_without_a_verdict(tmp_path):
+    fx = base_fixture()
+    fx["routes"]["pulls/7/reviews"] = {"*": ""}
+    result = run_gate(tmp_path, fx, repo="dsmolchanov/NeoMenu")
+    assert result.returncode != 0
+    assert "UNKNOWN" in result.stdout
+
+
+def test_an_unparseable_budget_is_red(tmp_path):
+    result = run_gate(tmp_path, clean_fixture(), full_rounds="lots")
+    assert result.returncode != 0, result.stdout
+    assert "non-negative integer" in result.stdout
+
+
+def test_a_prod_repository_is_not_on_the_fast_lane(tmp_path):
+    """The allowlist is exact: an unlisted repository keeps the full budget,
+    so a P1 holds its merge on round one."""
+    fx = clean_fixture()
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx, repo="dsmolchanov/teaming")
+    assert "Degraded" not in result.stdout, result.stdout
+    assert result.returncode != 0, "a P1 merged on a prod-lane repository"
+
+
+def test_a_lookalike_repository_name_is_not_on_the_fast_lane(tmp_path):
+    """Substring matching would put someone else's fork on the fast lane."""
+    fx = clean_fixture()
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx, repo="attacker/dsmolchanov-NeoMenu")
+    assert result.returncode != 0, result.stdout

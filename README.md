@@ -6,7 +6,15 @@ finding on the current head commit?**
 Verdict states are PASS / BLOCK / UNKNOWN, and only PASS exits 0. Absence of a
 verdict is not approval.
 
-What counts as "blocking" narrows after the review budget is spent. The gate
+What counts as "blocking" narrows after the review budget is spent. A repository named on the
+fast-lane list inside the workflow runs every round P0-only from the first —
+the shape a repository wants when P1 findings must never hold its merges but a
+data-loss, auth, or secret-exposure finding still must. The list lives in this
+pinned workflow, not in a caller input or a repository variable: a
+`pull_request` run executes the PR's own copy of the caller, and a repository
+variable needs only `write` access, so either would let the very pull request
+whose P1 should block it declare that P1 non-blocking. Changing the list is a
+reviewed change here, adopted by bumping the consumer's pin. The gate
 counts **completed review generations** statelessly from head-bound Codex
 verdicts (a review's `commit_id`, or a clean-summary comment naming a head —
 request anchors never count, because an anchor proves a request was posted, not
