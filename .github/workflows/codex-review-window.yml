@@ -133,6 +133,16 @@ jobs:
       # needs `contents`; the 👍 verdict lives on the issue-side reactions
       # endpoint; posting the review-request anchor needs `pull-requests: write`.
       # No `issues: write` — this gate writes no labels.
+      #
+      # `actions: read` exists for exactly one call: the waker probe, which asks
+      # /actions/workflows/... for the waker's state to decide the verdict
+      # window. Without it that endpoint answers 403, the probe fails soft, and
+      # the gate takes the long window FOREVER — the probe's safe failure mode
+      # silently disabling the optimization it guards. Observed live: the probe
+      # logged `Resource not accessible by integration` on the very PR that
+      # shipped it. Consumer stubs must grant this too, because a called
+      # workflow's permissions cannot exceed its caller's.
+      actions: read
       contents: read
       issues: read
       pull-requests: write

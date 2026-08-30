@@ -101,6 +101,11 @@ def test_permissions_cover_every_write_the_script_makes():
     # `issues: read` suffices now that the gate writes no labels.
     assert perms["issues"] == "read"
     assert perms["pull-requests"] == "write"
+    # The waker probe reads /actions/workflows/...; without `actions: read`
+    # that call 403s, the probe fails soft, and the long window applies
+    # forever — the short window silently never activates. Read, not write:
+    # the gate re-runs nothing.
+    assert perms["actions"] == "read"
     assert perms["contents"] == "read"
 
 
