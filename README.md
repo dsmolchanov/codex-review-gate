@@ -50,12 +50,14 @@ jobs:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
 ```
 
-**And** — not optional — the waker, in a second file. The gate waits only 120
-seconds for a verdict and then fails closed; a Codex verdict that arrives later
-re-opens the gate through events, and the clean-summary **comment** (how most
-clean verdicts arrive) only reaches the gate through this stub. A repository
-that installs the gate without the waker leaves every clean pull request red
-until someone re-runs the check by hand.
+**And** — not optional — the waker, in a second file. Where the waker is **active** in the repository (registered from the default
+branch and not disabled), the gate waits only 120 seconds for a verdict and then
+fails closed, because a verdict that arrives later re-opens the gate through
+events — and the clean-summary **comment** (how most clean verdicts arrive)
+only reaches the gate through this stub. Where the waker has not merged — or was disabled — the
+gate detects that and keeps its long 900s window, so the pull request that
+installs both files is not stranded by its own change: `issue_comment`
+workflows run only from the default branch and cannot fire from a PR branch.
 
 ```yaml
 name: codex-verdict-waker

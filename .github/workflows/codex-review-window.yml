@@ -550,7 +550,37 @@ jobs:
           # fire no webhook event of any kind. A reaction-only verdict landing
           # after this window needs a manual re-run, and the no-verdict error
           # below says so.
-          WINDOW="${VERDICT_WINDOW_SECONDS:-120}"
+          #
+          # THE SHORT WINDOW IS EARNED, NOT ASSUMED. An `issue_comment` workflow
+          # runs only when its file exists on the DEFAULT branch — so on the very
+          # pull request that installs the waker (and on every repository whose
+          # bootstrap PR ships both stubs together), the waker cannot fire yet.
+          # Shortening the window there strands a comment-shaped verdict with
+          # nothing to re-enter the gate. So the gate checks whether the waker
+          # is deployed where events can actually reach it, and keeps the old
+          # long window until it is. Failure direction: if this probe errors
+          # (rate limit, outage), the gate assumes NO waker and takes the long
+          # window — the pre-waker behaviour that was merely expensive, never
+          # unsafe. That is why this read deliberately does NOT go through the
+          # fail-hard api() wrapper: it selects a wait length, not a verdict.
+          # The probe asks the Actions API for the WORKFLOW, not the Contents API
+          # for the file: a workflow that was disabled in the UI, or that never
+          # registered because it only exists on a topic branch, still has a
+          # file — and a file cannot wake anything. Only `state: active` means
+          # events will actually start it. (An active workflow whose triggers
+          # have drifted is a different failure, and the consumer's design lock
+          # is what pins the stub's bytes against that.)
+          WAKER_STATE=$(gh api "repos/${REPO}/actions/workflows/codex-verdict-waker.yml" \
+            --jq '.state' 2>/dev/null || true)
+          WAKER_DEPLOYED=0
+          [ "${WAKER_STATE}" = "active" ] && WAKER_DEPLOYED=1
+          if [ "${WAKER_DEPLOYED}" -eq 1 ]; then
+            WINDOW="${VERDICT_WINDOW_SECONDS:-120}"
+            echo "The verdict waker is active in this repository; late verdicts re-enter, so the in-run window is ${WINDOW}s."
+          else
+            WINDOW="${VERDICT_WINDOW_SECONDS:-900}"
+            echo "No active verdict waker in this repository (state: ${WAKER_STATE:-absent}) — a comment-shaped verdict cannot re-enter the gate, so the in-run window stays ${WINDOW}s. Merging the waker stub shortens it."
+          fi
           DEADLINE=$((SECONDS + WINDOW))
           RIDS=""
           CLEAN=0
@@ -601,18 +631,22 @@ jobs:
               echo "::notice::Codex holds a PR-level 👍, but a reaction carries no commit id and cannot be attributed to ${HEAD_SHA}, so it is not accepted as this head's verdict. Re-run this job once Codex answers for this commit."
             fi
             if [ "${ANCHOR_FAILED}" -eq 1 ]; then
-              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR; the verdict will re-enter this gate on its own."
+              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s, and this run could not request one — the token is read-only, which is normal for a fork PR. The verdict is UNKNOWN, so the gate holds the merge. A maintainer can comment '@codex review' on the PR; a formal review re-enters this gate on its own."
               exit 1
             fi
-            # NOT "re-run this job once Codex has answered" any more. This window
-            # is deliberately short (see WINDOW above) and re-entry is automatic:
-            # a formal review fires `pull_request_review`, and a clean-summary
-            # comment is picked up by the waker, which re-runs this exact run.
-            # Telling an operator to poll and re-run by hand would describe work
-            # the fleet now does itself — and, worse, would train them to re-run
-            # a red gate reflexively, which is how a genuine BLOCK gets retried
-            # until it flakes green.
-            echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. This is EXPECTED while Codex is still reviewing: a review or a clean summary re-opens this gate automatically, so wait rather than pushing a commit to shake a verdict loose. Two cases do need a hand: a verdict delivered ONLY as a 👍 reaction (reactions fire no event, so nothing can re-enter — re-run this job), and a repo genuinely not connected to Codex Cloud (disconnect this required check in branch protection rather than opening a repo-wide bypass here)."
+            # The operator instruction must match what will actually happen,
+            # which depends on the waker. WITH an active waker, re-entry is
+            # automatic for every event-shaped verdict, and telling an operator
+            # to re-run by hand would train the one habit that defeats the
+            # gate: re-running a genuine BLOCK until it flakes green. WITHOUT
+            # one, only a formal review can re-enter — a comment-shaped verdict
+            # has no event path back here, and claiming it does leaves the PR
+            # red with an operator waiting on a promise nothing will keep.
+            if [ "${WAKER_DEPLOYED}" -eq 1 ]; then
+              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. This is EXPECTED while Codex is still reviewing: a review or a clean summary re-opens this gate automatically, so wait rather than pushing a commit to shake a verdict loose. Two cases do need a hand: a verdict delivered ONLY as a 👍 reaction (reactions fire no event, so nothing can re-enter — re-run this job), and a repo genuinely not connected to Codex Cloud (disconnect this required check in branch protection rather than opening a repo-wide bypass here)."
+            else
+              echo "::error::No Codex verdict for ${HEAD_SHA} within ${WINDOW}s — neither a review nor a 👍. The verdict is UNKNOWN, so the gate holds the merge. This repository has NO active verdict waker, so only a FORMAL review re-enters this gate by itself; a clean-summary comment will not. When the verdict arrives, re-run this job — or better, merge the codex-verdict-waker stub so re-entry is automatic. Do not push a commit to shake a verdict loose."
+            fi
             exit 1
           fi
 

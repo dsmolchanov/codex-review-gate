@@ -102,8 +102,13 @@ def emit(value):
 
 
 # Longest URL key first, so "pulls/7/reviews/555" beats "pulls/7".
+# A leading "=" means EXACT url match — for endpoints like the bare repo read
+# ("repos/owner/repo"), which as a SUBSTRING would swallow every other route.
 for key in sorted(fixture.get("routes", {}), key=len, reverse=True):
-    if key not in url:
+    if key.startswith("="):
+        if url != key[1:]:
+            continue
+    elif key not in url:
         continue
     value = fixture["routes"][key]
     if isinstance(value, str):
@@ -809,3 +814,65 @@ def test_rerun_still_holds_the_merge_on_a_blocker(tmp_path):
     result = run_gate(tmp_path, base_fixture(), debounce="3", run_attempt="2")
     assert result.returncode != 0, result.stdout
     assert "BLOCKER" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# The short verdict window is earned by a deployed waker, never assumed.
+#
+# An `issue_comment` workflow runs only from the DEFAULT branch, so the pull
+# request that installs the waker cannot be woken by it. The gate probes for
+# the waker where events can actually reach it and keeps the long pre-waker
+# window until the probe finds it. All three tests run with the window
+# OVERRIDDEN to zero, so what they assert is the gate's CHOICE — the message
+# naming which window applies — not the wait itself.
+# --------------------------------------------------------------------------
+
+
+def waker_deployed_fixture(state: str = "active") -> dict:
+    fx = clean_fixture()
+    fx["routes"]["actions/workflows/codex-verdict-waker.yml"] = {"state": state, "*": ""}
+    return fx
+
+
+def test_no_waker_keeps_the_long_window(tmp_path):
+    """A repo that has not merged the waker must keep the pre-waker window.
+
+    Shortening it there strands a comment-shaped verdict: nothing re-enters the
+    gate, and the PR stays red until a human re-runs the check by hand.
+    """
+    result = run_gate(tmp_path, clean_fixture())
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
+    assert "late verdicts re-enter" not in result.stdout
+
+
+def test_deployed_waker_takes_the_short_window(tmp_path):
+    result = run_gate(tmp_path, waker_deployed_fixture())
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "late verdicts re-enter, so the in-run window is" in result.stdout
+
+
+def test_disabled_waker_keeps_the_long_window(tmp_path):
+    """A workflow disabled in the UI still has a file; a file wakes nothing.
+
+    This is why the probe asks the Actions API for the workflow's STATE rather
+    than the Contents API for the file's existence — the short window must be
+    earned by something events will actually start.
+    """
+    result = run_gate(tmp_path, waker_deployed_fixture(state="disabled_manually"))
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
+
+
+def test_probe_failure_falls_back_to_the_long_window(tmp_path):
+    """The probe selects a wait length, not a verdict, so it must fail SOFT.
+
+    A gh outage on this one informational read must cost minutes (the long
+    window), never the merge — the verdict machinery still decides, and here it
+    still finds the clean review and exits 0.
+    """
+    fx = clean_fixture()
+    fx["routes"]["actions/workflows/codex-verdict-waker.yml"] = {"*": "__FAIL__"}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
