@@ -974,8 +974,14 @@ def test_debt_appends_to_an_existing_issue(tmp_path):
     assert "review-debt issue #42" in result.stdout
 
 
-def test_debt_filing_failure_never_holds_the_merge(tmp_path):
-    """The merge decision precedes the bookkeeping; a 403 costs the record."""
+def test_debt_filing_failure_never_holds_the_merge_and_never_duplicates(tmp_path):
+    """The merge decision precedes the bookkeeping; a 403 costs the record.
+
+    And when the DEDUP lookup is what failed, the gate must write NOTHING: an
+    empty lookup result born from an error is indistinguishable from "no issue
+    yet", and creating on it would duplicate the per-PR debt issue — the
+    one-issue contract broken by the very mechanism meant to keep it.
+    """
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
         "pull_request_review_id": P1_BODY_NO_BLOCKER,
@@ -986,3 +992,11 @@ def test_debt_filing_failure_never_holds_the_merge(tmp_path):
     assert result.returncode == 0, (
         f"a bookkeeping failure held a merge the verdict allowed:\n{result.stdout}\n{result.stderr}"
     )
+    calls = posted_bodies(tmp_path)
+    # The dedup lookup's --jq text legitimately names the title; what must be
+    # absent is any WRITE — the creation's `-f title=` or an append to a
+    # comments endpoint with a body.
+    assert "-f title=" not in calls, (
+        f"a failed dedup lookup created a possibly-duplicate issue:\n{calls}"
+    )
+    assert "writing nothing rather than risking a duplicate" in result.stdout

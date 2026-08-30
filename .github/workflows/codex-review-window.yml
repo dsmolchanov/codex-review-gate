@@ -787,11 +787,17 @@ jobs:
                 "${ROUND}" "${PR}" "${FULL_ROUNDS}" "${HEAD_SHA}" "${DEBT}")
               # One issue per PR, found by its exact title: a later degraded
               # round on the same PR appends a comment instead of filing a
-              # duplicate.
+              # duplicate. The lookup's failure is preserved, not swallowed
+              # into an empty result: an empty DEBT_ID from a 403 or 5xx would
+              # read as "no issue yet" and CREATE a duplicate — so when the
+              # existence question has no answer, warn and write nothing.
+              DEBT_LOOKUP_RC=0
               DEBT_ID=$(gh api --paginate "repos/${REPO}/issues?state=open&per_page=100" \
                 --jq ".[] | select(.pull_request == null) | select(.title == \"${DEBT_TITLE}\") | .number" \
-                2>/dev/null | head -1 || true)
-              if [ -n "${DEBT_ID}" ]; then
+                2>/dev/null | head -1) || DEBT_LOOKUP_RC=$?
+              if [ ${DEBT_LOOKUP_RC} -ne 0 ]; then
+                echo "::warning::Could not determine whether a review-debt issue already exists (rc=${DEBT_LOOKUP_RC}); writing nothing rather than risking a duplicate. The findings above merge unrecorded — file them by hand."
+              elif [ -n "${DEBT_ID}" ]; then
                 gh api "repos/${REPO}/issues/${DEBT_ID}/comments" -f body="${DEBT_BODY}" >/dev/null 2>&1 \
                   && echo "Appended the deferred findings for ${HEAD_SHORT} to review-debt issue #${DEBT_ID}." \
                   || echo "::warning::Could not append to review-debt issue #${DEBT_ID}; the findings above merge unrecorded. File them by hand."
