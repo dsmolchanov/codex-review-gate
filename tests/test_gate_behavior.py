@@ -828,12 +828,9 @@ def test_rerun_still_holds_the_merge_on_a_blocker(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def waker_deployed_fixture() -> dict:
+def waker_deployed_fixture(state: str = "active") -> dict:
     fx = clean_fixture()
-    # "=" is an exact-url key: the bare repo read would otherwise match every
-    # route as a substring.
-    fx["routes"]["=repos/owner/repo"] = {"default_branch": "main", "*": ""}
-    fx["routes"]["codex-verdict-waker.yml"] = {"path": ".github/workflows/codex-verdict-waker.yml", "*": ""}
+    fx["routes"]["actions/workflows/codex-verdict-waker.yml"] = {"state": state, "*": ""}
     return fx
 
 
@@ -855,6 +852,18 @@ def test_deployed_waker_takes_the_short_window(tmp_path):
     assert "late verdicts re-enter, so the in-run window is" in result.stdout
 
 
+def test_disabled_waker_keeps_the_long_window(tmp_path):
+    """A workflow disabled in the UI still has a file; a file wakes nothing.
+
+    This is why the probe asks the Actions API for the workflow's STATE rather
+    than the Contents API for the file's existence — the short window must be
+    earned by something events will actually start.
+    """
+    result = run_gate(tmp_path, waker_deployed_fixture(state="disabled_manually"))
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
+
+
 def test_probe_failure_falls_back_to_the_long_window(tmp_path):
     """The probe selects a wait length, not a verdict, so it must fail SOFT.
 
@@ -863,7 +872,7 @@ def test_probe_failure_falls_back_to_the_long_window(tmp_path):
     still finds the clean review and exits 0.
     """
     fx = clean_fixture()
-    fx["routes"]["=repos/owner/repo"] = {"*": "__FAIL__"}
+    fx["routes"]["actions/workflows/codex-verdict-waker.yml"] = {"*": "__FAIL__"}
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "cannot re-enter the gate, so the in-run window stays" in result.stdout

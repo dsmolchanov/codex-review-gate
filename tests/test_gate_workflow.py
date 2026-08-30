@@ -172,7 +172,7 @@ def test_every_verdict_read_goes_through_the_failing_api_wrapper():
     # pre-waker behaviour that was merely expensive, never unsafe. Routing it
     # through api() would block every merge whenever this one informational
     # read hiccuped.
-    WAKER_PROBE = 'gh api "repos/${REPO}" --jq \'.default_branch\''
+    WAKER_PROBE = 'gh api "repos/${REPO}/actions/workflows/codex-verdict-waker.yml"'
     forbidden = [
         m for m in re.findall(r"gh api[^\n]*\|\| true", code)
         if not m.startswith(IDENTITY_PROBE) and not m.startswith(WAKER_PROBE)
@@ -525,7 +525,7 @@ def test_the_short_window_is_earned_by_a_deployed_waker():
     # The probe itself must fail toward the long window: a gh error selecting a
     # wait length must not hold the merge, so it must NOT use the fail-hard
     # api() wrapper.
-    probe_start = SCRIPT.index("WAKER_PATH=")
+    probe_start = SCRIPT.index("WAKER_STATE=")
     probe = SCRIPT[probe_start : SCRIPT.index("DEADLINE=$((SECONDS + WINDOW))")]
     assert not re.search(r'(?<!gh )api "repos/\$\{REPO\}', probe), (
         "the waker probe uses the fail-hard wrapper; an outage would block the "
