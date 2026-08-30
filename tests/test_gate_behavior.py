@@ -133,6 +133,8 @@ def run_gate(
     action: str = "synchronize",
     grace: str = "0",
     request_token: str = "pat-for-tests",
+    debounce: str = "0",
+    run_attempt: str = "1",
 ):
     """Execute the gate's run: block with a stubbed gh; return CompletedProcess."""
     # A unique subdir per call, so one test can run the gate more than once.
@@ -171,7 +173,10 @@ def run_gate(
         "RUN_URL": "http://example/run",
         # Zero so the tests do not sleep. Production sets none of these three;
         # the window override exists only because a 15-minute wait is untestable.
-        "DEBOUNCE_SECONDS": "0",
+        "DEBOUNCE_SECONDS": debounce,
+        # A re-run must not pay the debounce again; `test_rerun_skips_the_debounce`
+        # sets this to "2" and asserts the gate does not sleep.
+        "RUN_ATTEMPT": run_attempt,
         "VERDICT_WINDOW_SECONDS": "0",
         "SETTLE_SECONDS": "0",
         # The grace window defaults to 90s in production, to cover the 59s
@@ -746,3 +751,61 @@ def test_no_verdict_is_still_red_after_the_cap(tmp_path):
     assert f"{OLD3}..{HEAD}" in calls
     assert result.returncode != 0
     assert "UNKNOWN" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# The runner is billed by the second, so a wait that buys nothing is a defect.
+#
+# These two tests are a PAIR and only mean something together: the first shows
+# the debounce still really sleeps, so the second's speed is evidence of the
+# skip rather than evidence that the debounce never worked. Asserting on elapsed
+# time is the only way to test a `sleep` — a grep cannot tell a live wait from a
+# dead one, which is the same reason this file exists at all.
+# --------------------------------------------------------------------------
+
+
+def test_first_attempt_still_debounces(tmp_path):
+    """A first synchronize run pays the quiet interval, as it always has."""
+    import time
+
+    started = time.monotonic()
+    result = run_gate(tmp_path, clean_fixture(), debounce="3", run_attempt="1")
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert elapsed >= 3, (
+        f"the debounce did not sleep ({elapsed:.1f}s) — this test's twin below "
+        "proves nothing unless the debounce is real"
+    )
+    assert "Debouncing" in result.stdout
+
+
+def test_rerun_skips_the_debounce(tmp_path):
+    """A re-run is the waker answering a verdict, not a burst of pushes.
+
+    Debouncing it would spend 90 more seconds of runner time re-reading a head
+    the run already read fresh from the API, and would delay exactly the answer
+    the waker exists to deliver.
+    """
+    import time
+
+    started = time.monotonic()
+    result = run_gate(tmp_path, clean_fixture(), debounce="3", run_attempt="2")
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert elapsed < 3, f"a re-run paid the debounce anyway ({elapsed:.1f}s)"
+    assert "skipping the debounce" in result.stdout
+    assert "Debouncing" not in result.stdout
+
+
+def test_rerun_still_holds_the_merge_on_a_blocker(tmp_path):
+    """Skipping the debounce must not skip the verdict.
+
+    The debounce branch sits directly above the verdict read, so an `elif` that
+    swallowed the rest of the pipeline would present as a fast green run — the
+    one failure mode of this change that would let a blocker merge.
+    """
+    result = run_gate(tmp_path, base_fixture(), debounce="3", run_attempt="2")
+    assert result.returncode != 0, result.stdout
+    assert "BLOCKER" in result.stdout

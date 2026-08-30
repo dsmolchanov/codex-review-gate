@@ -467,3 +467,74 @@ def test_a_broken_request_token_fails_closed():
     window = SCRIPT[idx : idx + 900]
     assert "::error::" in window
     assert "exit 1" in window
+
+
+# --------------------------------------------------------------------------
+# Runner occupancy
+#
+# A gate that sleeps on a rented runner is billed for the sleeping. The 900s
+# window cost 424 billed minutes across four repositories in one day, 263 of
+# them in runs `cancel-in-progress` killed mid-sleep. The window is now short
+# and the wait is event-driven; these tests hold that shape in place, because
+# the tempting "fix" for any future missed verdict is to widen the window again.
+# --------------------------------------------------------------------------
+
+
+def test_the_verdict_window_stays_short():
+    """Re-entry, not a longer sleep, is how a slow verdict is caught.
+
+    Widening this back out is the obvious-looking remedy for a verdict that
+    arrived late, and it is the wrong one: `codex-verdict-waker.yml` re-runs the
+    gate when a Codex summary comment lands, and `pull_request_review` re-runs
+    it when a formal review lands. Both re-enter for free. Seconds spent here
+    are paid for on every push whether or not they are needed.
+    """
+    m = re.search(r'WINDOW="\$\{VERDICT_WINDOW_SECONDS:-(\d+)\}"', SCRIPT)
+    assert m, "the verdict window default was not found"
+    window = int(m.group(1))
+    assert window <= 300, (
+        f"the verdict window is {window}s. A long in-run wait is billed runner "
+        "time; catch late verdicts by re-entry (the waker, or pull_request_review)."
+    )
+    # Not zero either. Exiting instantly would fail the check on every push and
+    # flap the PR red before any re-entry could answer, and the loop's
+    # check-at-least-once shape exists precisely because a zero window once made
+    # the gate report "Codex never answered" without asking.
+    assert window > 0
+
+
+def test_a_rerun_does_not_pay_the_debounce():
+    """The debounce exists to collapse a push burst; a re-run is not one.
+
+    `test_rerun_skips_the_debounce` in the behavioural suite asserts the elapsed
+    time. This asserts the wiring that makes it possible, so a dropped `env:`
+    entry fails here with a clear cause rather than as a slow test.
+    """
+    assert "RUN_ATTEMPT" in JOB["env"], "the job cannot tell a re-run from a first run"
+    assert JOB["env"]["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
+    # The attempt guard must be the branch that GUARDS the debounce, not merely
+    # present somewhere in the file: an `if` that ran alongside the sleep rather
+    # than instead of it would pass a containment check and sleep anyway.
+    guard = re.search(
+        r'if \[ "\$\{RUN_ATTEMPT:-1\}" -gt 1 \]; then\n(.*?\n)\s*elif .*?ACTION.*?synchronize',
+        SCRIPT,
+        re.S,
+    )
+    assert guard, "the debounce is not guarded by an attempt check on the same if/elif chain"
+    assert "sleep" not in guard.group(1), "the re-run branch sleeps"
+
+
+def test_the_no_verdict_error_does_not_prescribe_a_reflex_rerun():
+    """A red gate is usually Codex still working, and re-entry is automatic.
+
+    Telling an operator to re-run whenever the gate is red trains the one habit
+    that defeats it: re-running a genuine BLOCK until something flakes green.
+    The message must say the wait is automatic, and name the single case that
+    genuinely needs a hand — a 👍 reaction, which fires no event at all.
+    """
+    m = re.search(r"No Codex verdict for \$\{HEAD_SHA\} within \$\{WINDOW\}s —.*", SCRIPT)
+    assert m, "the no-verdict error was not found"
+    msg = m.group(0)
+    assert "automatically" in msg
+    assert "reaction" in msg
+    assert "wait rather than pushing a commit" in msg

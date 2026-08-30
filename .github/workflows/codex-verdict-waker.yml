@@ -1,0 +1,174 @@
+name: codex-verdict-waker
+# Re-enters `codex-review-window` when a Codex verdict arrives as a COMMENT.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The gate used to hold a runner for up to 900 seconds waiting for a verdict,
+# nearly all of it in `sleep 20`. That was 424 billed minutes across four
+# repositories in one day, 263 of which were burned by runs that
+# `cancel-in-progress` killed mid-sleep — paid for, then discarded. The gate's
+# window is now short (120s), which is only safe if a verdict landing after it
+# can re-open the gate by itself.
+#
+# Two of the three verdict shapes already can, or now can:
+#   * a formal review fires `pull_request_review: submitted`, which the gate
+#     itself listens to;
+#   * a clean-summary comment fires `issue_comment` — and this workflow turns
+#     that into a re-run of the gate.
+# The third, a bare 👍 REACTION, fires no webhook event at all and cannot be
+# covered by any workflow trigger. The gate's no-verdict error names that case
+# and asks for a manual re-run.
+#
+# WHY IT RE-RUNS RATHER THAN GATING
+# ---------------------------------
+# The gate cannot simply add `issue_comment` to its own `on:` block, for two
+# independent reasons documented at length in `codex-review-window.yml`: a
+# comment event runs from the DEFAULT BRANCH, so its check run is bound to the
+# default-branch SHA and can never satisfy the pull request's required check;
+# and the consumer stub's concurrency group is keyed on the PR number, so a
+# comment-triggered run would cancel the real PR-associated run.
+#
+# Re-running the PR-bound run sidesteps both. This workflow is not a required
+# check, so where its own check run lands is irrelevant; and the run it starts
+# is a new ATTEMPT of the original `pull_request` run, which reports the
+# `codex-review-window / codex-review-window` context against the pull
+# request's head commit — the SHA branch protection is actually waiting on.
+#
+# WHY IT TARGETS A RUN BY HEAD SHA
+# --------------------------------
+# A re-run reports against the head commit of the run it re-runs, NOT against
+# whatever the pull request's head is now. Re-running a stale run would post a
+# green check against a commit nobody is merging while the current head stays
+# unreviewed. So this workflow re-runs a run only when that run's `head_sha`
+# still equals the pull request's head. If the head has moved on, the push that
+# moved it started its own gate run and that run is the one that decides;
+# there is nothing to wake.
+# `workflow_call` only: `issue_comment` fires in the CONSUMER repository, so the
+# consumer installs a one-screen stub with the `issue_comment` trigger that
+# calls this body — the same host/stub split as the gate itself, for the same
+# reason: the logic reviewed once, where its tests are. The `github.event`
+# context a called workflow sees is the CALLER's event, so the guards below read
+# the comment exactly as if the trigger were declared here.
+on:
+  workflow_call:
+
+# NO `concurrency:` HERE — the CALLER owns the group, exactly as with the gate:
+# a callee declaring the same group as its caller enters a group its own caller
+# holds and, with cancel-in-progress, cancels it. The stub keys its group on
+# the PR number — its OWN group, never the gate's, which would be the
+# self-cancellation trap the gate's header warns about.
+
+jobs:
+  wake:
+    # Three guards, all cheap, all necessary:
+    #   * `issue.pull_request` — `issue_comment` fires for plain issues too, and
+    #     an issue has no head commit and no gate run.
+    #   * author is Codex — anyone can write a comment containing anything. This
+    #     grants no authority (the gate re-reads every verdict itself and trusts
+    #     only CODEX_BOT-authored artifacts); it just stops arbitrary chatter
+    #     from spending a runner.
+    #   * body names a Codex review — Codex also posts progress updates and
+    #     quota notices, and waking on those re-runs a gate that will only find
+    #     the same absence of a verdict.
+    if: >-
+      github.event.issue.pull_request != null &&
+      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+      contains(github.event.comment.body, 'Codex Review')
+    runs-on: ubuntu-latest
+    # A few API reads, at most one bounded wait on an in-flight gate run
+    # (WAKER_RECHECK_SECONDS, 240s), and at most one write. A waker that could
+    # hang would reintroduce exactly the cost this design removes.
+    timeout-minutes: 6
+    permissions:
+      # `actions: write` is the whole point — it is what allows the re-run.
+      # `pull-requests: read` reads the head SHA. Nothing else: this workflow
+      # posts no comment, sets no status, and writes no code.
+      actions: write
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.issue.number }}
+      GATE_WORKFLOW: codex-review-window.yml
+    steps:
+      - name: Re-run the gate for this pull request's head
+        run: |
+          set -euo pipefail
+
+          # This job decides nothing about mergeability — it only asks the gate
+          # to look again. So, unlike the gate, a failed read here must NOT hold
+          # anything: it just means no wake happened, and the pull request stays
+          # red until the next event or a manual re-run. Fail loudly, change
+          # nothing.
+          PR_JSON=$(gh api "repos/${REPO}/pulls/${PR}")
+          HEAD_SHA=$(printf '%s' "${PR_JSON}" | jq -r '.head.sha')
+          DRAFT=$(printf '%s' "${PR_JSON}" | jq -r '.draft')
+          STATE=$(printf '%s' "${PR_JSON}" | jq -r '.state')
+
+          if [ "${STATE}" != "open" ] || [ "${DRAFT}" = "true" ]; then
+            echo "PR #${PR} is ${STATE}${DRAFT:+, draft=${DRAFT}} — the gate does not run on it. Nothing to wake."
+            exit 0
+          fi
+          echo "PR #${PR} head is ${HEAD_SHA}."
+
+          # Newest first, and filtered to THIS head. `head_sha` is the field that
+          # matters, not `head_branch`: a re-run reports against the run's own
+          # head commit, so a run for a superseded commit is worse than useless.
+          RUN_JSON=$(gh api \
+            "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100" \
+            --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
+
+          # `status == completed` covers the states a re-run is permitted from.
+          # An in-progress run needs no wake — it is inside its own window and
+          # will see the comment on its next poll — and asking to re-run it
+          # returns 403.
+          TARGET=$(printf '%s' "${RUN_JSON}" \
+            | jq -r 'map(select(.status == "completed" and .conclusion != "success"))
+                     | if length == 0 then "" else .[0].id end')
+
+          if [ -z "${TARGET}" ]; then
+            RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
+            if [ "${RUNNING}" -gt 0 ]; then
+              # An in-flight run USUALLY sees the comment itself — its verdict
+              # poll is still cycling — but not always: a comment landing after
+              # the run's deadline expired, while it walks its no-verdict exit
+              # path, is invisible to it, and once it fails there is no later
+              # event to wake it. That interleaving is narrow (the exit path is
+              # a few API calls) but it strands the PR red when it hits. One
+              # bounded re-check covers it: wait out the in-flight run and
+              # re-run it only if it failed. The wait is capped by the gate's
+              # own short lifetime — window (120s) + grace (90s) + settle (15s)
+              # — and costs nothing in the common case where the gate goes
+              # green on its own (TARGET stays empty and this exits quietly).
+              echo "A gate run for ${HEAD_SHA} is still in flight; waiting for it rather than racing it."
+              RECHECK_DEADLINE=$((SECONDS + ${WAKER_RECHECK_SECONDS:-240}))
+              while :; do
+                sleep 15
+                RUN_JSON=$(gh api                   "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100"                   --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
+                RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
+                [ "${RUNNING}" -eq 0 ] && break
+                if [ ${SECONDS} -ge ${RECHECK_DEADLINE} ]; then
+                  echo "Gate run still in flight after the re-check budget; it outlives this waker and decides for itself."
+                  exit 0
+                fi
+              done
+              TARGET=$(printf '%s' "${RUN_JSON}"                 | jq -r 'map(select(.status == "completed" and .conclusion != "success"))
+                         | if length == 0 then "" else .[0].id end')
+            fi
+            if [ -z "${TARGET}" ]; then
+              echo "No completed, non-green gate run for ${HEAD_SHA}. Either the gate is already green or the head has moved on and its own run decides. Nothing to wake."
+              exit 0
+            fi
+          fi
+
+          echo "Re-running gate run ${TARGET} so it re-reads the verdict for ${HEAD_SHA}."
+          # A re-run races the gate's own `pull_request_review` re-entry when
+          # Codex posts a summary comment AND a formal review: whichever starts
+          # first wins the concurrency group and the other is cancelled. Both
+          # read the same verdict, so either outcome is correct — but the loser
+          # is a `cancelled` run, and a 409 here means the winner got there
+          # first. That is a no-op, not a failure.
+          if ! gh api --method POST "repos/${REPO}/actions/runs/${TARGET}/rerun" >/dev/null 2>&1; then
+            echo "::notice::Could not re-run ${TARGET} — most likely another event (a formal review, or a newer push) already restarted the gate for this head. No action needed."
+          fi
