@@ -43,12 +43,28 @@ name: codex-verdict-waker
 # still equals the pull request's head. If the head has moved on, the push that
 # moved it started its own gate run and that run is the one that decides;
 # there is nothing to wake.
-# `workflow_call` only: `issue_comment` fires in the CONSUMER repository, so the
-# consumer installs a one-screen stub with the `issue_comment` trigger that
-# calls this body — the same host/stub split as the gate itself, for the same
-# reason: the logic reviewed once, where its tests are. The `github.event`
-# context a called workflow sees is the CALLER's event, so the guards below read
-# the comment exactly as if the trigger were declared here.
+# `workflow_call` only: the triggering events fire in the CONSUMER repository,
+# so the consumer installs a one-screen stub carrying them and calls this body —
+# the same host/stub split as the gate itself, for the same reason: the logic
+# reviewed once, where its tests are. The `github.event` context a called
+# workflow sees is the CALLER's event, so the guards below read the comment or
+# the review exactly as if the triggers were declared here.
+#
+# TWO events, because a Codex verdict arrives in two shapes and BOTH can leave a
+# stale failed gate run behind:
+#
+#   * `issue_comment` — a clean-summary comment. The gate cannot listen to this
+#     itself (a comment event runs from the default branch, so its check run is
+#     bound to the wrong SHA), which is the original reason this workflow exists.
+#
+#   * `pull_request_review` — a formal review. The gate DOES listen to this and
+#     starts a fresh run, so re-entry was thought to be covered. It is not: the
+#     fresh run is a NEW check run, and the earlier run that failed for want of
+#     a verdict stays on the commit. GitHub's status rollup counts that stale
+#     failure, so the pull request reports BLOCKED while a newer run of the same
+#     context sits green beside it. Observed four times on 2026-08-31, each
+#     cleared only by re-running the stale run BY HAND — which is precisely the
+#     work this workflow exists to do.
 on:
   workflow_call:
 
@@ -60,20 +76,24 @@ on:
 
 jobs:
   wake:
-    # Three guards, all cheap, all necessary:
-    #   * `issue.pull_request` — `issue_comment` fires for plain issues too, and
-    #     an issue has no head commit and no gate run.
-    #   * author is Codex — anyone can write a comment containing anything. This
-    #     grants no authority (the gate re-reads every verdict itself and trusts
-    #     only CODEX_BOT-authored artifacts); it just stops arbitrary chatter
-    #     from spending a runner.
-    #   * body names a Codex review — Codex also posts progress updates and
-    #     quota notices, and waking on those re-runs a gate that will only find
-    #     the same absence of a verdict.
+    # One guard per event shape. Neither grants any authority — the gate
+    # re-reads every verdict itself and trusts only CODEX_BOT-authored
+    # artifacts — they only stop arbitrary chatter from spending a runner.
+    #
+    # comment path: `issue_comment` fires for plain issues too (an issue has no
+    #   head commit and no gate run), and Codex posts progress updates and quota
+    #   notices that name no verdict; waking on those re-runs a gate that will
+    #   only find the same absence.
+    # review path: any Codex-authored review is a completed verdict by
+    #   definition, so no body test is needed or wanted — a review carrying
+    #   findings is exactly the case where the stale failure must be cleared.
     if: >-
-      github.event.issue.pull_request != null &&
-      github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
-      contains(github.event.comment.body, 'Codex Review')
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+       contains(github.event.comment.body, 'Codex Review')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.user.login == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
     # A few API reads, at most one bounded wait on an in-flight gate run
     # (WAKER_RECHECK_SECONDS, 240s), and at most one write. A waker that could
@@ -89,7 +109,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR: ${{ github.event.issue.number }}
+      # `issue_comment` carries the PR as an issue; `pull_request_review`
+      # carries it as a pull request. Exactly one is ever set.
+      PR: ${{ github.event.issue.number || github.event.pull_request.number }}
       GATE_WORKFLOW: codex-review-window.yml
     steps:
       - name: Re-run the gate for this pull request's head
@@ -119,56 +141,70 @@ jobs:
             "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100" \
             --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
 
-          # `status == completed` covers the states a re-run is permitted from.
-          # An in-progress run needs no wake — it is inside its own window and
-          # will see the comment on its next poll — and asking to re-run it
+          # EVERY completed non-green run, not just the newest. A newer
+          # SUCCESS does not retire an older failure: both check runs stay on
+          # the commit, GitHub's rollup counts the failure, and the pull
+          # request reports BLOCKED with a green run sitting beside the red
+          # one. Selecting only `.[0]` left exactly that state behind whenever
+          # the gate's own `pull_request_review` re-entry produced the newer
+          # run — the bug this workflow was extended to close.
+          #
+          # `status == completed` is required: an in-progress run needs no wake
+          # (it is inside its own verdict window) and asking to re-run one
           # returns 403.
-          TARGET=$(printf '%s' "${RUN_JSON}" \
-            | jq -r 'map(select(.status == "completed" and .conclusion != "success"))
-                     | if length == 0 then "" else .[0].id end')
+          stale_runs() {
+            printf '%s' "$1" \
+              | jq -r 'map(select(.status == "completed" and .conclusion != "success")) | .[].id'
+          }
 
-          if [ -z "${TARGET}" ]; then
-            RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
-            if [ "${RUNNING}" -gt 0 ]; then
-              # An in-flight run USUALLY sees the comment itself — its verdict
-              # poll is still cycling — but not always: a comment landing after
-              # the run's deadline expired, while it walks its no-verdict exit
-              # path, is invisible to it, and once it fails there is no later
-              # event to wake it. That interleaving is narrow (the exit path is
-              # a few API calls) but it strands the PR red when it hits. One
-              # bounded re-check covers it: wait out the in-flight run and
-              # re-run it only if it failed. The wait is capped by the gate's
-              # own short lifetime — window (120s) + grace (90s) + settle (15s)
-              # — and costs nothing in the common case where the gate goes
-              # green on its own (TARGET stays empty and this exits quietly).
-              echo "A gate run for ${HEAD_SHA} is still in flight; waiting for it rather than racing it."
-              RECHECK_DEADLINE=$((SECONDS + ${WAKER_RECHECK_SECONDS:-240}))
-              while :; do
-                sleep 15
-                RUN_JSON=$(gh api                   "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100"                   --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
-                RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
-                [ "${RUNNING}" -eq 0 ] && break
-                if [ ${SECONDS} -ge ${RECHECK_DEADLINE} ]; then
-                  echo "Gate run still in flight after the re-check budget; it outlives this waker and decides for itself."
-                  exit 0
-                fi
-              done
-              TARGET=$(printf '%s' "${RUN_JSON}"                 | jq -r 'map(select(.status == "completed" and .conclusion != "success"))
-                         | if length == 0 then "" else .[0].id end')
-            fi
-            if [ -z "${TARGET}" ]; then
-              echo "No completed, non-green gate run for ${HEAD_SHA}. Either the gate is already green or the head has moved on and its own run decides. Nothing to wake."
-              exit 0
-            fi
+          TARGETS="$(stale_runs "${RUN_JSON}")"
+
+          RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
+          if [ "${RUNNING}" -gt 0 ]; then
+            # An in-flight run USUALLY sees the verdict itself — its poll is
+            # still cycling — but not always: a verdict landing after the run's
+            # deadline expired, while it walks its no-verdict exit path, is
+            # invisible to it, and once it fails there is no later event to
+            # wake it. That interleaving is narrow but it strands the PR red.
+            # And on the review path the in-flight run is usually the gate's
+            # OWN re-entry, whose success still leaves the earlier failure to
+            # be cleared — so wait it out and re-read the full set, rather than
+            # acting on a snapshot taken mid-flight.
+            #
+            # The wait is capped by the gate's own short lifetime — window
+            # (120s) + grace (90s) + settle (15s) — and costs nothing when the
+            # gate finishes clean with no stale run beside it.
+            echo "A gate run for ${HEAD_SHA} is still in flight; waiting for it rather than racing it."
+            RECHECK_DEADLINE=$((SECONDS + ${WAKER_RECHECK_SECONDS:-240}))
+            while :; do
+              sleep 15
+              RUN_JSON=$(gh api \
+                "repos/${REPO}/actions/workflows/${GATE_WORKFLOW}/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                --jq '[.workflow_runs[] | {id, status, conclusion, attempt: .run_attempt}]')
+              RUNNING=$(printf '%s' "${RUN_JSON}" | jq -r 'map(select(.status != "completed")) | length')
+              [ "${RUNNING}" -eq 0 ] && break
+              if [ ${SECONDS} -ge ${RECHECK_DEADLINE} ]; then
+                echo "Gate run still in flight after the re-check budget; it outlives this waker and decides for itself."
+                exit 0
+              fi
+            done
+            TARGETS="$(stale_runs "${RUN_JSON}")"
           fi
 
-          echo "Re-running gate run ${TARGET} so it re-reads the verdict for ${HEAD_SHA}."
-          # A re-run races the gate's own `pull_request_review` re-entry when
-          # Codex posts a summary comment AND a formal review: whichever starts
-          # first wins the concurrency group and the other is cancelled. Both
-          # read the same verdict, so either outcome is correct — but the loser
-          # is a `cancelled` run, and a 409 here means the winner got there
-          # first. That is a no-op, not a failure.
-          if ! gh api --method POST "repos/${REPO}/actions/runs/${TARGET}/rerun" >/dev/null 2>&1; then
-            echo "::notice::Could not re-run ${TARGET} — most likely another event (a formal review, or a newer push) already restarted the gate for this head. No action needed."
+          if [ -z "${TARGETS}" ]; then
+            echo "No completed, non-green gate run for ${HEAD_SHA}. Either the gate is already green or the head has moved on and its own run decides. Nothing to wake."
+            exit 0
           fi
+
+          # A re-run races the gate's own re-entry when Codex posts a summary
+          # comment AND a formal review: whichever starts first wins the
+          # concurrency group and the other is cancelled. Both read the same
+          # verdict, so either outcome is correct — a 409 here means the winner
+          # got there first. That is a no-op, not a failure, which is why the
+          # loop never exits non-zero: this job asks, it does not decide.
+          for TARGET in ${TARGETS}; do
+            echo "Re-running gate run ${TARGET} so it re-reads the verdict for ${HEAD_SHA}."
+            if ! gh api --method POST "repos/${REPO}/actions/runs/${TARGET}/rerun" >/dev/null 2>&1; then
+              echo "::notice::Could not re-run ${TARGET} — most likely another event (a formal review, or a newer push) already restarted the gate for this head. No action needed."
+            fi
+          done

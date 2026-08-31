@@ -40,6 +40,48 @@ def test_the_callee_declares_no_concurrency_group():
     assert "concurrency" not in DOC
 
 
+def test_waker_wakes_for_a_codex_review_too():
+    """A formal review must wake it, not only a comment.
+
+    The gate listens to `pull_request_review` itself, so re-entry looked
+    covered — but its fresh run is a NEW check run and the earlier run that
+    failed for want of a verdict stays on the commit. GitHub's rollup counts
+    that stale failure and the pull request reports BLOCKED with a green run of
+    the same context beside it. Clearing it is this workflow's job.
+    """
+    guard = JOB["if"]
+    assert "pull_request_review" in guard
+    assert "github.event.review.user.login" in guard
+    # A review carrying findings is exactly the case that must be cleared, so
+    # the review path must NOT be narrowed by a body test the way the comment
+    # path is.
+    review_clause = guard[guard.index("pull_request_review") :]
+    assert "contains(" not in review_clause
+
+
+def test_waker_resolves_the_pr_number_from_either_event():
+    """`issue_comment` carries the PR as an issue, `pull_request_review` as a
+    pull request. Reading only one leaves the other waking on an empty number,
+    which reads every gate run in the repository."""
+    pr = JOB["env"]["PR"]
+    assert "github.event.issue.number" in pr
+    assert "github.event.pull_request.number" in pr
+
+
+def test_waker_reruns_every_stale_run_not_just_the_newest():
+    """A newer SUCCESS does not retire an older failure.
+
+    Both check runs stay on the commit and the rollup counts the red one, so
+    selecting `.[0]` of the non-green set left the pull request BLOCKED with a
+    green run beside the red — cleared by hand four times before this loop
+    existed.
+    """
+    assert "for TARGET in ${TARGETS}" in SCRIPT, "the waker re-runs a single run"
+    # The selection must not collapse the set to one element.
+    assert ".[0].id" not in SCRIPT
+    assert "| .[].id" in SCRIPT
+
+
 def test_waker_wakes_only_for_codex_verdict_comments():
     """Anyone can write a comment; only Codex's own may spend a runner.
 
@@ -66,6 +108,9 @@ def test_waker_decides_nothing():
     writes = {k for k, v in perms.items() if v == "write"}
     assert writes == {"actions"}, f"unexpected write scopes: {writes}"
     posts = re.findall(r"--method POST[^\n]*", SCRIPT)
+    # Exactly one POST SITE — inside the loop over stale runs — and it is the
+    # re-run. More than one site would mean the waker learned to write
+    # something else.
     assert len(posts) == 1 and "/rerun" in posts[0], posts
 
 
