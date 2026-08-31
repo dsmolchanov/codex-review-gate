@@ -129,6 +129,29 @@ def test_waker_leaves_drafts_and_closed_prs_alone():
     assert re.search(r'"\$\{DRAFT\}" = "true"', SCRIPT)
 
 
+def test_reruns_are_serialized_against_the_gate_concurrency_group():
+    """Back-to-back re-runs would cancel each other.
+
+    Every gate run shares the consumer stub's concurrency group, which sets
+    `cancel-in-progress: true`. Firing the re-runs in a tight loop therefore
+    has each attempt cancel the one before it — and a cancelled run is
+    non-green, so the loop would manufacture the very stale artifact it exists
+    to clear. Each re-run must wait for its predecessor to complete.
+    """
+    # From the budget declaration (just above the loop) to the end.
+    loop = SCRIPT[SCRIPT.index("WAKER_RERUN_BUDGET") :]
+    assert "SERIAL_DEADLINE" in loop, "re-runs are not serialized"
+    assert 'RERUN_STATE' in loop and '"completed"' in loop, (
+        "the loop does not wait for a re-run to finish before starting the next"
+    )
+    # And the wait must be skipped after the last target, so the ordinary
+    # single-stale-run case pays nothing.
+    assert 'REMAINING' in loop
+    # Bounded on both axes: number of re-runs and time per wait.
+    assert "WAKER_RERUN_BUDGET" in loop
+    assert "WAKER_RECHECK_SECONDS" in loop
+
+
 def test_waker_cannot_hang_a_runner():
     """A hung waker re-creates the very cost this design removes.
 
@@ -138,7 +161,10 @@ def test_waker_cannot_hang_a_runner():
     means the thing being waited on is not the gate. The job timeout leaves
     headroom over that cap and nothing more.
     """
-    assert JOB["timeout-minutes"] <= 6
+    # Raised for the serialized re-runs: WAKER_RERUN_BUDGET (3) waits of
+    # WAKER_RECHECK_SECONDS (240s) is 12 minutes worst case, and every wait is
+    # deadline-capped so the job cannot outlive the arithmetic.
+    assert JOB["timeout-minutes"] <= 15
     m = re.search(r"WAKER_RECHECK_SECONDS:-(\d+)", SCRIPT)
     assert m, "the in-flight re-check lost its bound"
     assert int(m.group(1)) <= 240

@@ -95,10 +95,12 @@ jobs:
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
-    # A few API reads, at most one bounded wait on an in-flight gate run
-    # (WAKER_RECHECK_SECONDS, 240s), and at most one write. A waker that could
-    # hang would reintroduce exactly the cost this design removes.
-    timeout-minutes: 6
+    # A few API reads, a bounded wait on an in-flight gate run, and up to
+    # WAKER_RERUN_BUDGET (3) re-runs serialized behind each other at
+    # WAKER_RECHECK_SECONDS (240s) apiece. Every wait is deadline-capped: a
+    # waker that could hang would reintroduce exactly the cost this design
+    # removes.
+    timeout-minutes: 15
     permissions:
       # `actions: write` is the whole point — it is what allows the re-run.
       # `pull-requests: read` reads the head SHA. Nothing else: this workflow
@@ -202,9 +204,40 @@ jobs:
           # verdict, so either outcome is correct — a 409 here means the winner
           # got there first. That is a no-op, not a failure, which is why the
           # loop never exits non-zero: this job asks, it does not decide.
+          #
+          # SERIALIZED, and that is the whole subtlety. Every gate run shares
+          # the consumer stub's concurrency group, which sets
+          # `cancel-in-progress: true` — so firing these re-runs back to back
+          # would have each new attempt CANCEL the one before it, leaving a
+          # cancelled run behind. A cancelled run is non-green, so the loop
+          # would manufacture exactly the stale artifact it exists to clear.
+          # Each re-run therefore waits for its predecessor to finish. The wait
+          # is skipped after the LAST target, so the ordinary case — a single
+          # stale run, which is what every occurrence so far has been — costs
+          # nothing.
+          REMAINING=$(printf '%s' "${TARGETS}" | grep -c .)
+          BUDGET="${WAKER_RERUN_BUDGET:-3}"
           for TARGET in ${TARGETS}; do
+            if [ "${BUDGET}" -le 0 ]; then
+              echo "::notice::Re-run budget spent with stale gate runs left for ${HEAD_SHA}; the next verdict event clears the rest. Re-run them by hand to merge sooner."
+              break
+            fi
+            BUDGET=$((BUDGET - 1))
+            REMAINING=$((REMAINING - 1))
             echo "Re-running gate run ${TARGET} so it re-reads the verdict for ${HEAD_SHA}."
             if ! gh api --method POST "repos/${REPO}/actions/runs/${TARGET}/rerun" >/dev/null 2>&1; then
               echo "::notice::Could not re-run ${TARGET} — most likely another event (a formal review, or a newer push) already restarted the gate for this head. No action needed."
+              continue
             fi
+            [ "${REMAINING}" -le 0 ] && break
+            SERIAL_DEADLINE=$((SECONDS + ${WAKER_RECHECK_SECONDS:-240}))
+            while :; do
+              sleep 15
+              RERUN_STATE=$(gh api "repos/${REPO}/actions/runs/${TARGET}" --jq '.status' 2>/dev/null || true)
+              [ "${RERUN_STATE}" = "completed" ] && break
+              if [ ${SECONDS} -ge ${SERIAL_DEADLINE} ]; then
+                echo "::notice::Gate run ${TARGET} is still going; stopping here rather than starting a re-run that would cancel it. The next verdict event clears the rest."
+                exit 0
+              fi
+            done
           done
