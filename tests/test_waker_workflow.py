@@ -40,6 +40,48 @@ def test_the_callee_declares_no_concurrency_group():
     assert "concurrency" not in DOC
 
 
+def test_waker_wakes_for_a_codex_review_too():
+    """A formal review must wake it, not only a comment.
+
+    The gate listens to `pull_request_review` itself, so re-entry looked
+    covered — but its fresh run is a NEW check run and the earlier run that
+    failed for want of a verdict stays on the commit. GitHub's rollup counts
+    that stale failure and the pull request reports BLOCKED with a green run of
+    the same context beside it. Clearing it is this workflow's job.
+    """
+    guard = JOB["if"]
+    assert "pull_request_review" in guard
+    assert "github.event.review.user.login" in guard
+    # A review carrying findings is exactly the case that must be cleared, so
+    # the review path must NOT be narrowed by a body test the way the comment
+    # path is.
+    review_clause = guard[guard.index("pull_request_review") :]
+    assert "contains(" not in review_clause
+
+
+def test_waker_resolves_the_pr_number_from_either_event():
+    """`issue_comment` carries the PR as an issue, `pull_request_review` as a
+    pull request. Reading only one leaves the other waking on an empty number,
+    which reads every gate run in the repository."""
+    pr = JOB["env"]["PR"]
+    assert "github.event.issue.number" in pr
+    assert "github.event.pull_request.number" in pr
+
+
+def test_waker_reruns_every_stale_run_not_just_the_newest():
+    """A newer SUCCESS does not retire an older failure.
+
+    Both check runs stay on the commit and the rollup counts the red one, so
+    selecting `.[0]` of the non-green set left the pull request BLOCKED with a
+    green run beside the red — cleared by hand four times before this loop
+    existed.
+    """
+    assert "for TARGET in ${TARGETS}" in SCRIPT, "the waker re-runs a single run"
+    # The selection must not collapse the set to one element.
+    assert ".[0].id" not in SCRIPT
+    assert "| .[].id" in SCRIPT
+
+
 def test_waker_wakes_only_for_codex_verdict_comments():
     """Anyone can write a comment; only Codex's own may spend a runner.
 
@@ -66,6 +108,9 @@ def test_waker_decides_nothing():
     writes = {k for k, v in perms.items() if v == "write"}
     assert writes == {"actions"}, f"unexpected write scopes: {writes}"
     posts = re.findall(r"--method POST[^\n]*", SCRIPT)
+    # Exactly one POST SITE — inside the loop over stale runs — and it is the
+    # re-run. More than one site would mean the waker learned to write
+    # something else.
     assert len(posts) == 1 and "/rerun" in posts[0], posts
 
 
@@ -84,6 +129,34 @@ def test_waker_leaves_drafts_and_closed_prs_alone():
     assert re.search(r'"\$\{DRAFT\}" = "true"', SCRIPT)
 
 
+def test_reruns_are_serialized_against_the_gate_concurrency_group():
+    """Back-to-back re-runs would cancel each other.
+
+    Every gate run shares the consumer stub's concurrency group, which sets
+    `cancel-in-progress: true`. Firing the re-runs in a tight loop therefore
+    has each attempt cancel the one before it — and a cancelled run is
+    non-green, so the loop would manufacture the very stale artifact it exists
+    to clear. Each re-run must wait for its predecessor to complete.
+    """
+    # From the budget declaration (just above the loop) to the end.
+    loop = SCRIPT[SCRIPT.index("for TARGET in ${TARGETS}") :]
+    assert "SERIAL_DEADLINE" in loop, "re-runs are not serialized"
+    assert 'RERUN_STATE' in loop and '"completed"' in loop, (
+        "the loop does not wait for a re-run to finish before starting the next"
+    )
+    # And the wait must be skipped after the last target, so the ordinary
+    # single-stale-run case pays nothing.
+    assert 'REMAINING' in loop
+    # Bounded by TIME, never by a count: a count budget would re-run some of
+    # the stale runs and return, leaving the rest red with no further verdict
+    # event to finish the job — the blocked-forever state this workflow exists
+    # to abolish.
+    assert "WAKER_RECHECK_SECONDS" in loop
+    assert "WAKER_RERUN_BUDGET" not in SCRIPT, (
+        "a count budget leaves stale runs red with nothing left to clear them"
+    )
+
+
 def test_waker_cannot_hang_a_runner():
     """A hung waker re-creates the very cost this design removes.
 
@@ -93,7 +166,9 @@ def test_waker_cannot_hang_a_runner():
     means the thing being waited on is not the gate. The job timeout leaves
     headroom over that cap and nothing more.
     """
-    assert JOB["timeout-minutes"] <= 6
+    # Raised for the serialized drain; every wait is deadline-capped, so this
+    # is the outer bound rather than an expected duration.
+    assert JOB["timeout-minutes"] <= 30
     m = re.search(r"WAKER_RECHECK_SECONDS:-(\d+)", SCRIPT)
     assert m, "the in-flight re-check lost its bound"
     assert int(m.group(1)) <= 240
