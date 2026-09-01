@@ -65,9 +65,14 @@ name: codex-verdict-waker
 on:
   issue_comment:
     types: [created]
+  # A formal review also leaves a stale failed gate run behind: the gate's own
+  # re-entry starts a NEW check run while the earlier one that failed for want
+  # of a verdict stays on the commit, and the rollup counts the red one.
+  pull_request_review:
+    types: [submitted]
 
 concurrency:
-  group: codex-verdict-waker-${{ github.event.issue.number }}
+  group: codex-verdict-waker-${{ github.event.issue.number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
