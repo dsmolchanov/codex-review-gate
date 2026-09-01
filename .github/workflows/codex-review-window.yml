@@ -854,6 +854,15 @@ jobs:
                   # child that touched stdin would eat the remaining findings.
                   if gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="${DEBT_BODY}" </dev/null >/dev/null 2>&1; then
                     FILED=$((FILED + 1))
+                    # The snapshot was taken before the loop, so a title filed
+                    # INSIDE it is not in it. One degraded round walks several
+                    # reviews and a still-open finding is re-emitted in each,
+                    # so the same normalized title recurs within one batch —
+                    # dedup has to cover the batch, not just the repository as
+                    # it stood when the loop started. (The `while` reads a
+                    # here-string, not a pipe, so this assignment survives the
+                    # iteration.)
+                    OPEN_TITLES="${OPEN_TITLES}"$'\n'"${DEBT_TITLE}"
                   else
                     echo "::warning::Could not file review debt for: ${DEBT_TITLE}. It merges unrecorded — file it by hand."
                   fi

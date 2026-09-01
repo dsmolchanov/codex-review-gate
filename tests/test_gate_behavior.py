@@ -998,6 +998,32 @@ def test_each_deferred_finding_gets_its_own_issue(tmp_path):
     assert "filed 2, already open 0" in result.stdout
 
 
+def test_a_finding_repeated_within_one_batch_is_filed_once(tmp_path):
+    """Dedup must cover the batch, not only the repo as it was before it.
+
+    One degraded round walks several reviews, and a still-open finding is
+    re-emitted in each — so the same normalized title recurs inside a single
+    run. The open-title snapshot is taken before the loop, so a title filed
+    inside it has to be added as it goes.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", P1_BODY_NO_BLOCKER)
+            + "\n"
+            + debt_record("api/x.py", P1_BODY_NO_BLOCKER, url="https://example/c/2")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert calls.count("-f title=[review-debt] Unbounded request body") == 1, (
+        f"the same finding was filed twice in one batch:\n{calls}"
+    )
+    assert "filed 1, already open 1" in result.stdout
+
+
 def test_review_debt_carries_the_finding_and_the_policy(tmp_path):
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
