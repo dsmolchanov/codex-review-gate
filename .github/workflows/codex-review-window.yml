@@ -841,9 +841,20 @@ jobs:
                   # finding's own sentence, which is also the dedup key.
                   DEBT_NAME=$(printf '%s' "${DEBT_LINE}" \
                     | sed -E 's/!\[[^]]*\]\([^)]*\)//g; s/\*\*//g; s/\[BLOCKER\]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' \
-                    | cut -c1-180)
-                  [ -n "${DEBT_NAME}" ] || DEBT_NAME="finding in ${DEBT_PATH}"
-                  DEBT_TITLE="[review-debt] ${DEBT_NAME}"
+                    | cut -c1-140)
+                  [ -n "${DEBT_NAME}" ] || DEBT_NAME="finding"
+                  # The key carries WHERE, not just what. A display title alone
+                  # conflates distinct findings: the same class in two files,
+                  # an inline finding and a review-body one, or two names that
+                  # collide once the badge markup is stripped and the length
+                  # bounded. Under a title-only key the first of those files
+                  # and the rest are silently skipped, so the PR merges with
+                  # real P1s holding no record at all — the exact invariant
+                  # this block exists to keep. Location is in the title rather
+                  # than beside it because the title is also the only key the
+                  # cross-batch lookup has: open issues expose titles, not
+                  # bodies, so both levels of dedup must read the same string.
+                  DEBT_TITLE="[review-debt] ${DEBT_PATH}: ${DEBT_NAME}"
                   if printf '%s\n' "${OPEN_TITLES}" | grep -qxF "${DEBT_TITLE}"; then
                     SKIPPED=$((SKIPPED + 1))
                     continue
