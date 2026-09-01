@@ -828,9 +828,22 @@ def test_rerun_still_holds_the_merge_on_a_blocker(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def waker_deployed_fixture(state: str = "active") -> dict:
+# What a consumer's waker STUB declares, and what the reusable HOST declares.
+# The probe has to tell them apart: both are `state: active`, and only the first
+# can ever be started by a comment.
+STUB_WAKER = "name: codex-verdict-waker\non:\n  issue_comment:\n    types: [created]\n"
+HOST_WAKER = (
+    "name: codex-verdict-waker\n"
+    "# `issue_comment` fires in the CONSUMER repository, so the consumer\n"
+    "# installs a stub with the issue_comment trigger that calls this body.\n"
+    "on:\n  workflow_call:\n"
+)
+
+
+def waker_deployed_fixture(state: str = "active", file: str = STUB_WAKER) -> dict:
     fx = clean_fixture()
     fx["routes"]["actions/workflows/codex-verdict-waker.yml"] = {"state": state, "*": ""}
+    fx["routes"]["contents/.github/workflows/codex-verdict-waker.yml"] = {"*": file}
     return fx
 
 
@@ -850,6 +863,31 @@ def test_deployed_waker_takes_the_short_window(tmp_path):
     result = run_gate(tmp_path, waker_deployed_fixture())
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "late verdicts re-enter, so the in-run window is" in result.stdout
+
+
+def test_a_workflow_call_host_is_not_a_waker(tmp_path):
+    """`state: active` is necessary and not sufficient.
+
+    In the gate's OWN repository the path resolves to the reusable host, which
+    is `workflow_call` only: active, and impossible to start with a comment. The
+    probe read that as a deployed waker and handed the one repository with no
+    re-entry path the short window, so every clean verdict there needed a manual
+    re-run. The file's prose mentions `issue_comment` repeatedly, so the check
+    has to read the trigger, not the text.
+    """
+    result = run_gate(tmp_path, waker_deployed_fixture(file=HOST_WAKER))
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
+    assert "issue_comment trigger: 0" in result.stdout
+
+
+def test_a_waker_file_that_cannot_be_read_keeps_the_long_window(tmp_path):
+    """Same failure direction as the state probe: expensive, never unsafe."""
+    fx = waker_deployed_fixture()
+    fx["routes"]["contents/.github/workflows/codex-verdict-waker.yml"] = {"*": "__FAIL__"}
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "cannot re-enter the gate, so the in-run window stays" in result.stdout
 
 
 def test_disabled_waker_keeps_the_long_window(tmp_path):
@@ -900,29 +938,213 @@ def issue_posts(tmp_path):
     ]
 
 
+def debt_record(path: str, body: str, url: str = "https://example/c/1") -> str:
+    """What the debt jq renders for one inline finding: path, link, first line."""
+    return f"{path}\t{url}\t{body}"
+
+
+def debt_title(path: str, body: str) -> str:
+    """The title the gate will compute for this record — fingerprint included.
+
+    Identity is a hash of the path and the COMPLETE finding line, so a fixture
+    that wants to model "already recorded" has to produce the same key the gate
+    will.
+    """
+    import hashlib
+    import re as _re
+
+    name = _re.sub(r"!\[[^]]*\]\([^)]*\)", "", body)
+    name = _re.sub(r"<[^>]*>", "", name)
+    name = name.replace("**", "").replace("[BLOCKER]", "").strip()
+    name = _re.sub(r"\s+", " ", name)
+    fp = hashlib.sha256(f"{path}\0{body}".encode()).hexdigest()[:12]
+    return f"[review-debt] {path}: {name} ({fp})"
+
+
+def test_a_long_path_cannot_push_the_title_past_the_api_limit(tmp_path):
+    """A rejected POST lands in the fail-soft branch and the P1 vanishes.
+
+    GitHub caps an issue title at 256 characters and `gh -f` truncates nothing,
+    so an uncapped title turns "record the debt" into "warn and merge".
+    """
+    long_path = "src/" + "nested/" * 20 + "module.py"
+    assert len(long_path) > 100
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record(long_path, "**![P1 Badge](x) " + "y" * 200 + "**"),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    titles = [
+        line.split("-f title=", 1)[1].split(" -f body=", 1)[0]
+        for line in posted_bodies(tmp_path).splitlines()
+        if "-f title=" in line
+    ]
+    assert titles, "nothing was filed"
+    for title in titles:
+        assert len(title) <= 256, f"title is {len(title)} chars: {title}"
+
+
+def test_titles_that_collide_after_truncation_stay_distinct(tmp_path):
+    """Two findings agreeing in their first 200 characters are still two.
+
+    Under a display-text key the first files and the second is skipped, so a
+    real P1 merges with no record — silently, which is the whole failure mode.
+    """
+    shared = "z" * 220
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", f"**![P1 Badge](x) {shared} first**")
+            + "\n"
+            + debt_record("api/x.py", f"**![P1 Badge](x) {shared} second**", url="https://example/c/2")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "filed 2, already open 0" in result.stdout, result.stdout
+
+
+def test_badge_html_never_reaches_the_title(tmp_path):
+    """Codex wraps its badge in <sub> tags, which markdown stripping leaves."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record(
+            "api/x.py",
+            "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub>  Recheck the head**",
+        ),
+        "*": "",
+    }
+    run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "-f title=[review-debt] api/x.py: Recheck the head (" in calls, calls
+    assert "<sub>" not in calls.split("-f body=")[0]
+
+
 def test_deferred_p1s_merge_and_are_filed_as_review_debt(tmp_path):
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
-        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
         "*": "",
     }
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert "Review debt: PR #7" in calls, "the deferred P1 was not filed"
-    assert "review-debt issue" in result.stdout
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls, (
+        f"the deferred P1 was not filed under its own title:\n{calls}"
+    )
+    assert "filed 1, already open 0" in result.stdout
+
+
+def test_a_debt_title_survives_the_badge_markup(tmp_path):
+    """The title is the dedup key, so it must be the finding's own sentence.
+
+    Codex wraps a finding in bold and a badge image; carried verbatim into a
+    title, that is unreadable in a list AND unstable as a key.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY),
+        "*": "",
+    }
+    run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "-f title=[review-debt] api/x.py: Fix the thing (" in calls, calls
+    assert "img.shields.io" not in calls.split("-f body=")[0]
+
+
+def test_each_deferred_finding_gets_its_own_issue(tmp_path):
+    """One bundle is open or closed for everything in it.
+
+    A per-PR issue cannot retire a fixed finding without either closing its
+    unfixed siblings or staying open as a reminder of nothing in particular.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", P1_BODY_NO_BLOCKER)
+            + "\n"
+            + debt_record("api/y.py", "**![P1 Badge](x) Retry loop never terminates**")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls
+    assert "[review-debt] api/y.py: Retry loop never terminates (" in calls
+    assert "filed 2, already open 0" in result.stdout
+
+
+def test_a_finding_repeated_within_one_batch_is_filed_once(tmp_path):
+    """Dedup must cover the batch, not only the repo as it was before it.
+
+    One degraded round walks several reviews, and a still-open finding is
+    re-emitted in each — so the same normalized title recurs inside a single
+    run. The open-title snapshot is taken before the loop, so a title filed
+    inside it has to be added as it goes.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", P1_BODY_NO_BLOCKER)
+            + "\n"
+            + debt_record("api/x.py", P1_BODY_NO_BLOCKER, url="https://example/c/2")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert calls.count("-f title=[review-debt] api/x.py: Unbounded request body (") == 1, (
+        f"the same finding was filed twice in one batch:\n{calls}"
+    )
+    assert "filed 1, already open 1" in result.stdout
+
+
+def test_same_titled_findings_in_different_files_are_both_filed(tmp_path):
+    """The dedup key is identity, not display text.
+
+    A title alone conflates distinct findings — the same class in two files, an
+    inline finding and a review-body one, or two names that collide once the
+    badge markup is stripped and the length bounded. Under a title-only key the
+    first files and the rest are silently skipped, so the PR merges with real
+    P1s holding no record at all.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", P1_BODY_NO_BLOCKER)
+            + "\n"
+            + debt_record("api/y.py", P1_BODY_NO_BLOCKER, url="https://example/c/2")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls, calls
+    assert "[review-debt] api/y.py: Unbounded request body (" in calls, calls
+    assert "filed 2, already open 0" in result.stdout
 
 
 def test_review_debt_carries_the_finding_and_the_policy(tmp_path):
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
-        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
         "*": "",
     }
     run_gate(tmp_path, fx)
     calls = posted_bodies(tmp_path)
     assert "exceeded the review budget" in calls
     assert HEAD in calls, "the debt record does not name the merged head"
+    assert "api/x.py" in calls, "the debt record does not name the file"
+    assert "https://example/c/1" in calls, (
+        "the debt record does not link back to the finding, so the issue "
+        "carries only a headline"
+    )
 
 
 def test_no_debt_issue_on_a_full_round(tmp_path):
@@ -958,20 +1180,23 @@ def test_degraded_p0_blocks_and_files_no_debt(tmp_path):
     assert "Review debt:" not in posted_bodies(tmp_path)
 
 
-def test_debt_appends_to_an_existing_issue(tmp_path):
-    """One issue per PR: a later degraded round comments, never duplicates."""
+def test_an_already_recorded_finding_is_not_refiled(tmp_path):
+    """A still-open finding is re-emitted every degraded round.
+
+    Dedup is by open title, the same key the trunk review already uses, so the
+    second round records nothing new rather than accumulating duplicates.
+    """
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
-        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
         "*": "",
     }
-    # The open-issues listing returns an existing debt issue, number 42.
-    fx["routes"]["issues?state=open"] = {"select(.title ==": "42", "*": ""}
+    fx["routes"]["issues?state=open"] = {"*": debt_title("api/x.py", P1_BODY_NO_BLOCKER)}
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert "issues/42/comments" in calls, "did not append to the existing issue"
-    assert "review-debt issue #42" in result.stdout
+    assert "-f title=" not in calls, f"refiled an already-open finding:\n{calls}"
+    assert "filed 0, already open 1" in result.stdout
 
 
 def test_debt_filing_failure_never_holds_the_merge_and_never_duplicates(tmp_path):
