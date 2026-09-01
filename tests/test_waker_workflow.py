@@ -139,7 +139,7 @@ def test_reruns_are_serialized_against_the_gate_concurrency_group():
     to clear. Each re-run must wait for its predecessor to complete.
     """
     # From the budget declaration (just above the loop) to the end.
-    loop = SCRIPT[SCRIPT.index("WAKER_RERUN_BUDGET") :]
+    loop = SCRIPT[SCRIPT.index("for TARGET in ${TARGETS}") :]
     assert "SERIAL_DEADLINE" in loop, "re-runs are not serialized"
     assert 'RERUN_STATE' in loop and '"completed"' in loop, (
         "the loop does not wait for a re-run to finish before starting the next"
@@ -147,9 +147,14 @@ def test_reruns_are_serialized_against_the_gate_concurrency_group():
     # And the wait must be skipped after the last target, so the ordinary
     # single-stale-run case pays nothing.
     assert 'REMAINING' in loop
-    # Bounded on both axes: number of re-runs and time per wait.
-    assert "WAKER_RERUN_BUDGET" in loop
+    # Bounded by TIME, never by a count: a count budget would re-run some of
+    # the stale runs and return, leaving the rest red with no further verdict
+    # event to finish the job — the blocked-forever state this workflow exists
+    # to abolish.
     assert "WAKER_RECHECK_SECONDS" in loop
+    assert "WAKER_RERUN_BUDGET" not in SCRIPT, (
+        "a count budget leaves stale runs red with nothing left to clear them"
+    )
 
 
 def test_waker_cannot_hang_a_runner():
@@ -161,10 +166,9 @@ def test_waker_cannot_hang_a_runner():
     means the thing being waited on is not the gate. The job timeout leaves
     headroom over that cap and nothing more.
     """
-    # Raised for the serialized re-runs: WAKER_RERUN_BUDGET (3) waits of
-    # WAKER_RECHECK_SECONDS (240s) is 12 minutes worst case, and every wait is
-    # deadline-capped so the job cannot outlive the arithmetic.
-    assert JOB["timeout-minutes"] <= 15
+    # Raised for the serialized drain; every wait is deadline-capped, so this
+    # is the outer bound rather than an expected duration.
+    assert JOB["timeout-minutes"] <= 30
     m = re.search(r"WAKER_RECHECK_SECONDS:-(\d+)", SCRIPT)
     assert m, "the in-flight re-check lost its bound"
     assert int(m.group(1)) <= 240
