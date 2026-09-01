@@ -839,9 +839,10 @@ jobs:
                   # badge image markdown and the bold markers Codex wraps a
                   # finding in, and bound the length. What remains is the
                   # finding's own sentence, which is also the dedup key.
+                  # `<sub>` and friends survive markdown stripping and land in
+                  # the title verbatim, so HTML tags go too.
                   DEBT_NAME=$(printf '%s' "${DEBT_LINE}" \
-                    | sed -E 's/!\[[^]]*\]\([^)]*\)//g; s/\*\*//g; s/\[BLOCKER\]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g' \
-                    | cut -c1-140)
+                    | sed -E 's/!\[[^]]*\]\([^)]*\)//g; s/<[^>]*>//g; s/\*\*//g; s/\[BLOCKER\]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
                   [ -n "${DEBT_NAME}" ] || DEBT_NAME="finding"
                   # The key carries WHERE, not just what. A display title alone
                   # conflates distinct findings: the same class in two files,
@@ -854,7 +855,21 @@ jobs:
                   # than beside it because the title is also the only key the
                   # cross-batch lookup has: open issues expose titles, not
                   # bodies, so both levels of dedup must read the same string.
-                  DEBT_TITLE="[review-debt] ${DEBT_PATH}: ${DEBT_NAME}"
+                  # IDENTITY IS A FINGERPRINT, DISPLAY IS THE REST. Keying on
+                  # the shown text alone loses findings two ways, and both are
+                  # silent: two distinct findings whose names agree in their
+                  # first N characters collapse into one record, and a path long
+                  # enough to push the title past GitHub's 256-character limit
+                  # makes the POST fail — into a fail-soft branch that warns and
+                  # merges anyway. So the key is a bounded hash of the FULL
+                  # untruncated identity, and the readable part is whatever fits
+                  # around it. The hash is over path plus the complete finding
+                  # line, which is exactly what a re-emission repeats and what
+                  # two different findings differ in.
+                  DEBT_FP=$(printf '%s\0%s' "${DEBT_PATH}" "${DEBT_LINE}" \
+                    | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
+                  DEBT_DISPLAY=$(printf '%s: %s' "${DEBT_PATH}" "${DEBT_NAME}" | cut -c1-200)
+                  DEBT_TITLE="[review-debt] ${DEBT_DISPLAY} (${DEBT_FP})"
                   if printf '%s\n' "${OPEN_TITLES}" | grep -qxF "${DEBT_TITLE}"; then
                     SKIPPED=$((SKIPPED + 1))
                     continue

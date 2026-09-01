@@ -943,6 +943,86 @@ def debt_record(path: str, body: str, url: str = "https://example/c/1") -> str:
     return f"{path}\t{url}\t{body}"
 
 
+def debt_title(path: str, body: str) -> str:
+    """The title the gate will compute for this record — fingerprint included.
+
+    Identity is a hash of the path and the COMPLETE finding line, so a fixture
+    that wants to model "already recorded" has to produce the same key the gate
+    will.
+    """
+    import hashlib
+    import re as _re
+
+    name = _re.sub(r"!\[[^]]*\]\([^)]*\)", "", body)
+    name = _re.sub(r"<[^>]*>", "", name)
+    name = name.replace("**", "").replace("[BLOCKER]", "").strip()
+    name = _re.sub(r"\s+", " ", name)
+    fp = hashlib.sha256(f"{path}\0{body}".encode()).hexdigest()[:12]
+    return f"[review-debt] {path}: {name} ({fp})"
+
+
+def test_a_long_path_cannot_push_the_title_past_the_api_limit(tmp_path):
+    """A rejected POST lands in the fail-soft branch and the P1 vanishes.
+
+    GitHub caps an issue title at 256 characters and `gh -f` truncates nothing,
+    so an uncapped title turns "record the debt" into "warn and merge".
+    """
+    long_path = "src/" + "nested/" * 20 + "module.py"
+    assert len(long_path) > 100
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record(long_path, "**![P1 Badge](x) " + "y" * 200 + "**"),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    titles = [
+        line.split("-f title=", 1)[1].split(" -f body=", 1)[0]
+        for line in posted_bodies(tmp_path).splitlines()
+        if "-f title=" in line
+    ]
+    assert titles, "nothing was filed"
+    for title in titles:
+        assert len(title) <= 256, f"title is {len(title)} chars: {title}"
+
+
+def test_titles_that_collide_after_truncation_stay_distinct(tmp_path):
+    """Two findings agreeing in their first 200 characters are still two.
+
+    Under a display-text key the first files and the second is skipped, so a
+    real P1 merges with no record — silently, which is the whole failure mode.
+    """
+    shared = "z" * 220
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": (
+            debt_record("api/x.py", f"**![P1 Badge](x) {shared} first**")
+            + "\n"
+            + debt_record("api/x.py", f"**![P1 Badge](x) {shared} second**", url="https://example/c/2")
+        ),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "filed 2, already open 0" in result.stdout, result.stdout
+
+
+def test_badge_html_never_reaches_the_title(tmp_path):
+    """Codex wraps its badge in <sub> tags, which markdown stripping leaves."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record(
+            "api/x.py",
+            "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub>  Recheck the head**",
+        ),
+        "*": "",
+    }
+    run_gate(tmp_path, fx)
+    calls = posted_bodies(tmp_path)
+    assert "-f title=[review-debt] api/x.py: Recheck the head (" in calls, calls
+    assert "<sub>" not in calls.split("-f body=")[0]
+
+
 def test_deferred_p1s_merge_and_are_filed_as_review_debt(tmp_path):
     fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
     fx["routes"]["pulls/7/comments"] = {
@@ -952,7 +1032,7 @@ def test_deferred_p1s_merge_and_are_filed_as_review_debt(tmp_path):
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert "[review-debt] api/x.py: Unbounded request body" in calls, (
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls, (
         f"the deferred P1 was not filed under its own title:\n{calls}"
     )
     assert "filed 1, already open 0" in result.stdout
@@ -971,7 +1051,7 @@ def test_a_debt_title_survives_the_badge_markup(tmp_path):
     }
     run_gate(tmp_path, fx)
     calls = posted_bodies(tmp_path)
-    assert "-f title=[review-debt] api/x.py: Fix the thing" in calls, calls
+    assert "-f title=[review-debt] api/x.py: Fix the thing (" in calls, calls
     assert "img.shields.io" not in calls.split("-f body=")[0]
 
 
@@ -993,8 +1073,8 @@ def test_each_deferred_finding_gets_its_own_issue(tmp_path):
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert "[review-debt] api/x.py: Unbounded request body" in calls
-    assert "[review-debt] api/y.py: Retry loop never terminates" in calls
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls
+    assert "[review-debt] api/y.py: Retry loop never terminates (" in calls
     assert "filed 2, already open 0" in result.stdout
 
 
@@ -1018,7 +1098,7 @@ def test_a_finding_repeated_within_one_batch_is_filed_once(tmp_path):
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert calls.count("-f title=[review-debt] api/x.py: Unbounded request body") == 1, (
+    assert calls.count("-f title=[review-debt] api/x.py: Unbounded request body (") == 1, (
         f"the same finding was filed twice in one batch:\n{calls}"
     )
     assert "filed 1, already open 1" in result.stdout
@@ -1045,8 +1125,8 @@ def test_same_titled_findings_in_different_files_are_both_filed(tmp_path):
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
-    assert "[review-debt] api/x.py: Unbounded request body" in calls, calls
-    assert "[review-debt] api/y.py: Unbounded request body" in calls, calls
+    assert "[review-debt] api/x.py: Unbounded request body (" in calls, calls
+    assert "[review-debt] api/y.py: Unbounded request body (" in calls, calls
     assert "filed 2, already open 0" in result.stdout
 
 
@@ -1111,7 +1191,7 @@ def test_an_already_recorded_finding_is_not_refiled(tmp_path):
         "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
         "*": "",
     }
-    fx["routes"]["issues?state=open"] = {"*": "[review-debt] api/x.py: Unbounded request body"}
+    fx["routes"]["issues?state=open"] = {"*": debt_title("api/x.py", P1_BODY_NO_BLOCKER)}
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     calls = posted_bodies(tmp_path)
