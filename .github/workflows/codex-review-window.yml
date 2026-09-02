@@ -856,7 +856,12 @@ jobs:
                 # Fail-soft like every read in this block: a fetch or plan
                 # failure costs the record, never the merge.
                 GATE_REPO="${GATE_WORKFLOW_REF%%/.github/*}"
-                [ -n "${GATE_REPO}" ] && [ -n "${GATE_SHA:-}" ] || { GATE_REPO="${REPO}"; GATE_SHA="${GITHUB_SHA:-}"; }
+                if [ -z "${GATE_REPO}" ] || [ -z "${GATE_SHA:-}" ]; then
+                  # No reusable-workflow coordinates: a run in the gate's own
+                  # repository, where the script sits at this run's commit.
+                  GATE_REPO="${REPO}"
+                  GATE_SHA="${GITHUB_SHA:-}"
+                fi
                 DEBT_DIR=$(mktemp -d)
                 DEBT_TOOL_RC=0
                 gh api "repos/${GATE_REPO}/contents/scripts/review_debt.py?ref=${GATE_SHA}" \
