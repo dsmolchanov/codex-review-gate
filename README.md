@@ -132,3 +132,10 @@ python3 -m pytest tests -q
 `tests/test_gate_behavior.py` executes the workflow's `run:` block under bash
 against a fixture-driven `gh` stub and asserts exit codes; a check not
 demonstrated to fail is not a check.
+
+`tests/test_review_debt.py` pins the identity rule for review-debt records —
+what makes two deferred findings the same finding. The rule lives in
+`scripts/review_debt.py`, which the workflow fetches from this repository at its
+own pinned commit (`job.workflow_sha`) on a degraded round; the shell keeps only
+the fail-soft API calls. The policy and its rejected alternatives (line number,
+comment id, PR number) are stated in that file's docstring.

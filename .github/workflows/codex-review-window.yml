@@ -135,8 +135,8 @@ jobs:
       # `issues: write` exists for exactly one write: the review-debt record.
       # On a round past the review budget the gate merges over open P1s, and a
       # finding that blocks nothing and is recorded nowhere is a finding
-      # deleted — so the gate files ONE issue carrying the deferred findings
-      # before it exits 0. It still writes no labels, posts no other issue,
+      # deleted — so the gate files one issue per deferred finding before it
+      # exits 0. It still writes no labels, posts no other issue,
       # and never reads an issue to AUTHORIZE anything (see the header: a
       # GITHUB_TOKEN comment cannot be attributed to a workflow, so nothing
       # here trusts one).
@@ -204,6 +204,17 @@ jobs:
       # would let the job report `skipped`, which branch protection counts as
       # SATISFIED — the failure mode this whole file exists to prevent.
       - name: Gate on Codex verdict for this commit
+        env:
+          # Where THIS workflow's bytes live. The review-debt identity is
+          # computed by scripts/review_debt.py fetched from the gate repository
+          # at the same commit the consumer pinned in `uses:` — so a consumer
+          # that pins a revision gets that revision's identity rule, never
+          # `main`'s. `job.workflow_*` names the REUSABLE workflow's file when
+          # the job comes from one (`github.workflow_*` would name the caller),
+          # and the run's own coordinates for a run in this repository. The
+          # `job` context is not available in job-level `env:`, hence here.
+          GATE_WORKFLOW_REF: ${{ job.workflow_ref }}
+          GATE_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
 
@@ -780,7 +791,7 @@ jobs:
           # a finding that blocks nothing and is recorded NOWHERE is a finding
           # deleted — the PR closes, the threads fall out of every queue, and
           # the debt silently becomes permanent. So before the exit 0, re-scan
-          # with the FULL pattern and file the deferred findings as ONE issue.
+          # with the FULL pattern and file each deferred finding as an issue.
           #
           # Fail-soft throughout, and deliberately NOT through api(): the
           # merge decision is already made — P0s were counted above and there
@@ -833,67 +844,55 @@ jobs:
               else
                 FILED=0
                 SKIPPED=0
-                while IFS=$'\t' read -r DEBT_PATH DEBT_URL DEBT_LINE; do
-                  [ -n "${DEBT_LINE}" ] || continue
-                  # A title has to survive being read in a list, so strip the
-                  # badge image markdown and the bold markers Codex wraps a
-                  # finding in, and bound the length. What remains is the
-                  # finding's own sentence, which is also the dedup key.
-                  # `<sub>` and friends survive markdown stripping and land in
-                  # the title verbatim, so HTML tags go too.
-                  DEBT_NAME=$(printf '%s' "${DEBT_LINE}" \
-                    | sed -E 's/!\[[^]]*\]\([^)]*\)//g; s/<[^>]*>//g; s/\*\*//g; s/\[BLOCKER\]//g; s/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')
-                  [ -n "${DEBT_NAME}" ] || DEBT_NAME="finding"
-                  # The key carries WHERE, not just what. A display title alone
-                  # conflates distinct findings: the same class in two files,
-                  # an inline finding and a review-body one, or two names that
-                  # collide once the badge markup is stripped and the length
-                  # bounded. Under a title-only key the first of those files
-                  # and the rest are silently skipped, so the PR merges with
-                  # real P1s holding no record at all — the exact invariant
-                  # this block exists to keep. Location is in the title rather
-                  # than beside it because the title is also the only key the
-                  # cross-batch lookup has: open issues expose titles, not
-                  # bodies, so both levels of dedup must read the same string.
-                  # IDENTITY IS A FINGERPRINT, DISPLAY IS THE REST. Keying on
-                  # the shown text alone loses findings two ways, and both are
-                  # silent: two distinct findings whose names agree in their
-                  # first N characters collapse into one record, and a path long
-                  # enough to push the title past GitHub's 256-character limit
-                  # makes the POST fail — into a fail-soft branch that warns and
-                  # merges anyway. So the key is a bounded hash of the FULL
-                  # untruncated identity, and the readable part is whatever fits
-                  # around it. The hash is over path plus the complete finding
-                  # line, which is exactly what a re-emission repeats and what
-                  # two different findings differ in.
-                  DEBT_FP=$(printf '%s\0%s' "${DEBT_PATH}" "${DEBT_LINE}" \
-                    | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-12)
-                  DEBT_DISPLAY=$(printf '%s: %s' "${DEBT_PATH}" "${DEBT_NAME}" | cut -c1-200)
-                  DEBT_TITLE="[review-debt] ${DEBT_DISPLAY} (${DEBT_FP})"
-                  if printf '%s\n' "${OPEN_TITLES}" | grep -qxF "${DEBT_TITLE}"; then
-                    SKIPPED=$((SKIPPED + 1))
-                    continue
-                  fi
-                  DEBT_BODY=$(printf 'Round %s of PR #%s exceeded the review budget (%s full rounds), so this still-open finding no longer holds the merge and the PR merged over it. It is recorded here so the debt survives the PR.\n\nPR: #%s\nHead: %s\nFile: %s\nFinding: %s\n\n%s\n\nFix the invariant, not the instance — see AGENTS.md.' \
-                    "${ROUND}" "${PR}" "${FULL_ROUNDS}" "${PR}" "${HEAD_SHA}" "${DEBT_PATH}" "${DEBT_URL}" "${DEBT_LINE}")
-                  # `</dev/null` because this runs inside a `read` loop: a
-                  # child that touched stdin would eat the remaining findings.
-                  if gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="${DEBT_BODY}" </dev/null >/dev/null 2>&1; then
-                    FILED=$((FILED + 1))
-                    # The snapshot was taken before the loop, so a title filed
-                    # INSIDE it is not in it. One degraded round walks several
-                    # reviews and a still-open finding is re-emitted in each,
-                    # so the same normalized title recurs within one batch —
-                    # dedup has to cover the batch, not just the repository as
-                    # it stood when the loop started. (The `while` reads a
-                    # here-string, not a pipe, so this assignment survives the
-                    # iteration.)
-                    OPEN_TITLES="${OPEN_TITLES}"$'\n'"${DEBT_TITLE}"
+                # WHAT IDENTIFIES A FINDING is decided in scripts/review_debt.py,
+                # not here. Four of five review rounds on the per-finding change
+                # landed on that one question, each answered by a narrower sed
+                # pipeline in this heredoc; the rule now lives in a file with a
+                # name, a docstring stating the policy (why not a line number,
+                # not a comment id, not the PR number), and unit tests over the
+                # cases those rounds found. The script is fetched from the gate
+                # repository at THIS workflow's own commit — the revision the
+                # consumer pinned — so identity and workflow cannot drift apart.
+                # Fail-soft like every read in this block: a fetch or plan
+                # failure costs the record, never the merge.
+                GATE_REPO="${GATE_WORKFLOW_REF%%/.github/*}"
+                [ -n "${GATE_REPO}" ] && [ -n "${GATE_SHA:-}" ] || { GATE_REPO="${REPO}"; GATE_SHA="${GITHUB_SHA:-}"; }
+                DEBT_DIR=$(mktemp -d)
+                DEBT_TOOL_RC=0
+                gh api "repos/${GATE_REPO}/contents/scripts/review_debt.py?ref=${GATE_SHA}" \
+                  -H "Accept: application/vnd.github.raw+json" > "${DEBT_DIR}/review_debt.py" 2>/dev/null || DEBT_TOOL_RC=$?
+                if [ "${DEBT_TOOL_RC}" -ne 0 ] || ! [ -s "${DEBT_DIR}/review_debt.py" ]; then
+                  echo "::warning::Could not fetch scripts/review_debt.py from ${GATE_REPO}@${GATE_SHA} (rc=${DEBT_TOOL_RC}); writing nothing rather than guessing an identity. The findings above merge unrecorded — file them by hand."
+                else
+                  printf '%s\n' "${OPEN_TITLES}" > "${DEBT_DIR}/open-titles"
+                  DEBT_PLAN_RC=0
+                  DEBT_PLAN=$(printf '%s' "${DEBT}" | python3 "${DEBT_DIR}/review_debt.py" plan \
+                    --pr "${PR}" --round "${ROUND}" --full-rounds "${FULL_ROUNDS}" --head "${HEAD_SHA}" \
+                    --open-titles "${DEBT_DIR}/open-titles" --out "${DEBT_DIR}") || DEBT_PLAN_RC=$?
+                  if [ "${DEBT_PLAN_RC}" -ne 0 ]; then
+                    echo "::warning::review_debt.py plan failed (rc=${DEBT_PLAN_RC}); writing nothing rather than guessing an identity. The findings above merge unrecorded — file them by hand."
                   else
-                    echo "::warning::Could not file review debt for: ${DEBT_TITLE}. It merges unrecorded — file it by hand."
+                    # One line per record: `<n> <TAB> new|open <TAB> title`.
+                    # `open` covers both an already-open issue and a repeat
+                    # within this batch — a still-open finding is re-emitted
+                    # by every review the degraded round walks.
+                    while IFS=$'\t' read -r DEBT_N DEBT_STATUS DEBT_TITLE; do
+                      [ -n "${DEBT_N}" ] || continue
+                      if [ "${DEBT_STATUS}" = "open" ]; then
+                        SKIPPED=$((SKIPPED + 1))
+                        continue
+                      fi
+                      # `</dev/null` because this runs inside a `read` loop: a
+                      # child that touched stdin would eat the remaining findings.
+                      if gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="$(cat "${DEBT_DIR}/${DEBT_N}.body")" </dev/null >/dev/null 2>&1; then
+                        FILED=$((FILED + 1))
+                      else
+                        echo "::warning::Could not file review debt for: ${DEBT_TITLE}. It merges unrecorded — file it by hand."
+                      fi
+                    done <<< "${DEBT_PLAN}"
+                    echo "Review debt for ${HEAD_SHORT}: filed ${FILED}, already open ${SKIPPED}."
                   fi
-                done <<< "${DEBT}"
-                echo "Review debt for ${HEAD_SHORT}: filed ${FILED}, already open ${SKIPPED}."
+                fi
               fi
             fi
           fi
