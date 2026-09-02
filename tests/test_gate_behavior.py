@@ -151,6 +151,14 @@ def run_gate(
     stub.write_text(GH_STUB, encoding="utf-8")
     stub.chmod(0o755)
 
+    # The review-debt identity script is fetched from the gate repository at
+    # the workflow's own commit. Unless a test says otherwise, that fetch works
+    # and returns THIS checkout's script — the bytes the workflow would pin.
+    fixture = {**fixture, "routes": {**fixture.get("routes", {})}}
+    fixture["routes"].setdefault(
+        "contents/scripts/review_debt.py",
+        {"*": (REPO_ROOT / "scripts" / "review_debt.py").read_text(encoding="utf-8")},
+    )
     fixture_path = run_dir / "fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     calls = run_dir / "calls.log"
@@ -182,6 +190,9 @@ def run_gate(
         # A re-run must not pay the debounce again; `test_rerun_skips_the_debounce`
         # sets this to "2" and asserts the gate does not sleep.
         "RUN_ATTEMPT": run_attempt,
+        # The reusable-workflow coordinates the debt block fetches its script from.
+        "GATE_WORKFLOW_REF": "owner/gate/.github/workflows/codex-review-window.yml@refs/heads/main",
+        "GATE_SHA": "b" * 40,
         "VERDICT_WINDOW_SECONDS": "0",
         "SETTLE_SECONDS": "0",
         # The grace window defaults to 90s in production, to cover the 59s
@@ -948,17 +959,16 @@ def debt_title(path: str, body: str) -> str:
 
     Identity is a hash of the path and the COMPLETE finding line, so a fixture
     that wants to model "already recorded" has to produce the same key the gate
-    will.
+    will. The gate gets that key from scripts/review_debt.py, so this asks the
+    same module rather than restating the rule.
     """
-    import hashlib
-    import re as _re
+    import sys as _sys
 
-    name = _re.sub(r"!\[[^]]*\]\([^)]*\)", "", body)
-    name = _re.sub(r"<[^>]*>", "", name)
-    name = name.replace("**", "").replace("[BLOCKER]", "").strip()
-    name = _re.sub(r"\s+", " ", name)
-    fp = hashlib.sha256(f"{path}\0{body}".encode()).hexdigest()[:12]
-    return f"[review-debt] {path}: {name} ({fp})"
+    if str(REPO_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(REPO_ROOT))
+    from scripts.review_debt import title
+
+    return title(path, body)
 
 
 def test_a_long_path_cannot_push_the_title_past_the_api_limit(tmp_path):
@@ -1225,3 +1235,34 @@ def test_debt_filing_failure_never_holds_the_merge_and_never_duplicates(tmp_path
         f"a failed dedup lookup created a possibly-duplicate issue:\n{calls}"
     )
     assert "writing nothing rather than risking a duplicate" in result.stdout
+
+
+def test_an_unfetchable_identity_script_never_holds_the_merge_and_files_nothing(tmp_path):
+    """The identity rule lives in the gate repository; the fetch is bookkeeping.
+
+    When it fails the gate must not fall back to guessing a key — a guessed key
+    is a duplicate on the next round — and must not hold a merge the verdict
+    already allowed. It warns, and the P1 merges unrecorded, by hand.
+    """
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
+        "*": "",
+    }
+    fx["routes"]["contents/scripts/review_debt.py"] = "__FAIL__"
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "-f title=" not in posted_bodies(tmp_path)
+    assert "Could not fetch scripts/review_debt.py" in result.stdout
+
+
+def test_the_identity_script_is_fetched_at_the_workflow_commit_not_main(tmp_path):
+    """A consumer that pins `uses: ...@<sha>` must get <sha>'s identity rule."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
+        "*": "",
+    }
+    run_gate(tmp_path, fx)
+    calls = (tmp_path / "run0" / "calls.log").read_text(encoding="utf-8")
+    assert "repos/owner/gate/contents/scripts/review_debt.py?ref=" + "b" * 40 in calls

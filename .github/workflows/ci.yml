@@ -18,4 +18,13 @@ jobs:
       - name: Actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint .github/workflows/codex-review-window.yml .github/workflows/codex-verdict-waker.yml .github/workflows/ci.yml
+          # `job.workflow_ref` / `job.workflow_sha` are documented job-context
+          # properties (the reusable workflow's own file and commit, where
+          # `github.workflow_*` name the caller's) and are populated at runtime
+          # — observed in run 33587072261 of this repository — but actionlint's
+          # type table (through v1.7.12) predates them. Ignore exactly those
+          # two messages; everything else stays a hard failure.
+          ./actionlint \
+            -ignore 'property "workflow_ref" is not defined in object type {check_run_id' \
+            -ignore 'property "workflow_sha" is not defined in object type {check_run_id' \
+            .github/workflows/codex-review-window.yml .github/workflows/codex-verdict-waker.yml .github/workflows/ci.yml
