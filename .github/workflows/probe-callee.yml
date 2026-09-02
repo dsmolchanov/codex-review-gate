@@ -1,0 +1,15 @@
+name: probe-callee
+on:
+  workflow_call:
+jobs:
+  callee:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          GH_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GH_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          echo "PROBE callee job.workflow_ref=[${JOB_WORKFLOW_REF}] job.workflow_sha=[${JOB_WORKFLOW_SHA}]"
+          echo "PROBE callee github.workflow_ref=[${GH_WORKFLOW_REF}] github.workflow_sha=[${GH_WORKFLOW_SHA}] github.sha=[${GITHUB_SHA}]"
