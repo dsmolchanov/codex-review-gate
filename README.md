@@ -18,6 +18,18 @@ findings to be re-emitted with their badges, so an unresolved P1 on an earlier
 head cannot vanish behind a clean delta. UNKNOWN fails in every round — the
 budget never overrides a missing verdict.
 
+**A clean verdict retracts older findings on the same head.** Codex answers the
+same commit twice: a formal review carrying what it found, then — once the
+finding is argued away — the verbatim clean sentence naming that same commit. A
+head-bound clean verdict therefore supersedes every head-bound verdict on that
+head that is **strictly older** than it. Ties keep the finding, an unreadable
+timestamp keeps the finding, and a review published *after* the clean signal is
+untouched and still decides the merge. Retraction is not a waiver: it reads the
+same verbatim sentence that already releases a review-less head, and it can only
+turn the gate green on a head Codex itself last spoke about as clean. Without it
+the only escape from a retracted finding is pushing a new commit — the "shake a
+verdict loose" this gate's own error text forbids.
+
 It exists as a standalone repository because a gate distributed as *content* is
 reviewed once per consumer. Copying the body into eight repositories put the
 same file in front of eight independent reviewers and produced 21 blocking
@@ -40,7 +52,11 @@ concurrency:
 
 jobs:
   codex-review-window:
-    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@v1
+    # A COMMIT SHA, never a tag: this caller forwards CODEX_REQUEST_TOKEN,
+    # SLACK_WEBHOOK and a write-capable token to whatever the ref resolves to,
+    # and a tag is mutable — retagging it would change the code holding those
+    # secrets in every consumer at once, with no diff anywhere to review.
+    uses: dsmolchanov/codex-review-gate/.github/workflows/codex-review-window.yml@<commit sha>
     permissions:
       actions: read   # the gate probes the waker's state to size its window
       contents: read

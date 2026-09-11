@@ -48,6 +48,15 @@ P1_BODY = "**![P1 Badge](https://img.shields.io/badge/P1-orange) [BLOCKER] Fix t
 # most severe case, and it is the one a P1-only verdict pattern let through.
 P0_BODY_NO_BLOCKER = "**![P0 Badge](https://img.shields.io/badge/P0-red) Data loss on retry**"
 P1_BODY_NO_BLOCKER = "**![P1 Badge](https://img.shields.io/badge/P1-orange) Unbounded request body**"
+# Routes a query to the CLEAN_TS read, which asks for `.created_at` off the
+# clean-verdict comment. That URL carries five different jq programs, and the
+# stub answers with the FIRST substring key it finds in insertion order, so the
+# key has to be unique to this one. `.created_at` alone is NOT: the round-state
+# read renders `"\(.created_at) \(...)"` and anchor_comment_id() compares
+# `.created_at == .updated_at`, so both would be mis-routed onto this value. The
+# only other filter carrying a `| not)` is the clean-comment COUNT, and it ends
+# `| .id] | .[]` — so the suffix below is what separates the two.
+CLEAN_TS_KEY = "| not) | .created_at"
 
 GH_STUB = r'''#!/usr/bin/env python3
 """Fixture-driven `gh` stub.
@@ -607,14 +616,263 @@ def verdict_heads(*shas):
 def round_fixture(*prior, head_review: bool):
     """N prior verdict-bearing heads; the current head reviewed or not."""
     fx = base_fixture()
+    # ORDER IS LOAD-BEARING. The stub answers with the first substring key it
+    # finds in insertion order, and this URL carries two filters that overlap:
+    # the verdict read (review_rows_for_head) contains BOTH `commit_id == "` and
+    # `submitted_at`, while the round-state read contains only `submitted_at`.
+    # With `submitted_at` first, the verdict read is answered with the PRIOR
+    # HEADS instead of this head's review — RIDS then holds 40-hex SHAs, the
+    # marker scan builds `pull_request_review_id == aaaa…` (a bare jq
+    # identifier), jq refuses to compile, and every degraded-round and
+    # review-debt case fails for a reason that has nothing to do with the gate.
     fx["routes"]["pulls/7/reviews"] = {
-        "submitted_at": verdict_heads(*prior),
         'commit_id == "': "555" if head_review else "",
+        "submitted_at": verdict_heads(*prior),
         "*": "",
     }
     if not head_review:
         fx["routes"]["pulls/7/comments"] = {"*": ""}
     return fx
+
+
+def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=()):
+    """A head carrying `review_row` ("<submitted_at> <id>") and a clean verdict.
+
+    Key order inside each route value is LOAD-BEARING: the stub answers with the
+    first substring match in insertion order, and both routes below are read by
+    several filters at once.
+
+    * `pulls/7/reviews` — the raw-rows read's filter contains BOTH
+      `commit_id == "` and `submitted_at`; the round-state read contains only
+      `submitted_at`. Head review first, so each lands on its own value.
+    * `issues/7/comments` — `capture(` is the round-state read, CLEAN_TS_KEY is
+      the clean-timestamp read, and the verbatim sentence is last because the
+      round-state read matches it too and must not be answered by it.
+    """
+    fx = base_fixture()
+    fx["routes"]["pulls/7/reviews"] = {
+        'commit_id == "': review_row,
+        "submitted_at": verdict_heads(*prior),
+        "*": "",
+    }
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": P1_BODY_NO_BLOCKER,
+        "*": "",
+    }
+    comments = {}
+    if prior:
+        comments["capture("] = verdict_heads(*prior)
+    comments[CLEAN_TS_KEY] = clean_ts
+    if clean_count:
+        comments["Didn't find any major issues"] = str(clean_count)
+    comments["*"] = ""
+    fx["routes"]["issues/7/comments"] = comments
+    return fx
+
+
+# --------------------------------------------------------------------------
+# A clean verdict on a head RETRACTS the findings of older verdicts on it
+# --------------------------------------------------------------------------
+#
+# Codex answers the same head twice: a formal review carrying what it found
+# first, then — once the finding is argued away — the verbatim clean sentence
+# naming that same commit. The gate treated every review of the head as a
+# standing verdict, so the retracted finding held the merge forever, and the
+# only way out was the "push to shake a verdict loose" this file's own error
+# text forbids. Observed on dsmolchanov/BoardAi#183: review 5181190639 carried
+# an inline P1 on c63d88f at 16:39:51, Codex posted "Didn't find any major
+# issues ... Reviewed commit: c63d88fde1" at 16:44:09, and the gate failed that
+# same head at 16:47:43 with (inline: 1, body: 0).
+#
+# The rule: a head-bound clean verdict retracts the findings of every head-bound
+# verdict STRICTLY OLDER than it. It is not a waiver — it reads the same verbatim
+# sentence that already releases a review-less head — and it can only ever turn
+# the gate green on a head Codex itself last spoke about as clean.
+
+
+def test_a_clean_verdict_retracts_an_older_formal_review(tmp_path):
+    """The BoardAi#183 regression: the retracted P1 must stop holding the merge."""
+    fx = retraction_fixture(
+        "2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555", clean_count=1
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, (
+        "a clean verdict on this head did not retract the earlier P1 review, so "
+        f"the pr stayed blocked with Codex having approved it:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    # Assert on the record, not only the exit code: the retraction is the one
+    # case where a finding is deliberately not counted, and a silent deletion is
+    # the one thing a reader could not reconstruct afterwards.
+    assert "supersedes" in result.stdout + result.stderr, (
+        f"the retraction was not reported:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_an_unparsable_clean_timestamp_retracts_nothing(tmp_path):
+    """The fail-open this filter would otherwise ship.
+
+    A comparator that drops rows when the clean timestamp is unreadable turns a
+    missing value into "newer than everything": every review on the PR is
+    swallowed, the marker scan iterates nothing, and the gate exits 0 on an open
+    P1. It is not hypothetical — jq's `max` over an empty array yields the
+    literal string "null", and awk compares "2026-..." < "null" as strings. The
+    read emits one line per match and aggregates with tail for exactly that
+    reason, and the comparator shape-checks its operand as well.
+
+    clean_count is 1 on purpose, and it is what makes this test bite: with no
+    clean summary the run exits 1 whether the review was swallowed or counted,
+    so the fail-open stays invisible. With the clean path live, a comparator
+    that swallows the review reaches exit 0 and only a guarded one holds.
+
+    Fails if the comparator is the naive one — `awk '$1 < clean'` over the raw
+    timestamps, with no 14-digit key and no shape check. Verified by mutation:
+    that version turns this test red on the "9001" and "null" cases.
+    """
+    for clean_ts in ("9001", "null", ""):
+        fx = retraction_fixture(
+            clean_ts, "2026-08-17T00:00:00Z 555", clean_count=1
+        )
+        result = run_gate(tmp_path, fx)
+        assert result.returncode != 0, (
+            f"CLEAN_TS={clean_ts!r} swallowed every review on the pr "
+            f"({result.stdout})"
+        )
+
+
+def test_a_review_newer_than_the_clean_verdict_still_blocks(tmp_path):
+    """The grace window's whole reason to exist, in the retraction's terms.
+
+    A formal review is routinely published AFTER the clean signal that announces
+    it. The filter drops only on a STRICTLY OLDER timestamp, so such a review
+    survives and still decides the merge.
+
+    clean_count is 1 on purpose — with no clean summary the run exits 1 whether
+    the review was kept or swallowed, so an inverted comparator would hide
+    behind the no-verdict path. Verified by mutation: inverting the comparison
+    to `rk > ck` turns this test red only once the clean path is live.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T01:00:00Z", "2026-08-17T02:00:00Z 555", clean_count=1
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, (
+        f"a review newer than the clean verdict was retracted:\n{result.stdout}"
+    )
+
+
+def test_a_tie_keeps_the_review(tmp_path):
+    """Equal timestamps keep the finding. A tie is a blocker, not a retraction.
+
+    Second-granularity timestamps make a tie reachable, and the ambiguous
+    reading is the one that holds the merge.
+
+    clean_count is 1 on purpose. Without a clean summary the run exits 1 either
+    way — dropping the tie leaves no verdict, which is also red — so the test
+    would pass for a reason unrelated to the comparator. With the clean path
+    live, dropping the tie reaches exit 0 and only a keeping comparator holds.
+
+    Fails if the comparator drops on `<=` rather than `<`.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T00:00:00Z", "2026-08-17T00:00:00Z 555", clean_count=1
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, f"a tie retracted the finding:\n{result.stdout}"
+
+
+def test_mixed_timestamp_precision_cannot_swallow_a_newer_review(tmp_path):
+    """A sub-second timestamp must not sort BEFORE a whole-second one.
+
+    Compared as raw strings, "2026-08-17T00:00:00.500Z" sorts before
+    "2026-08-17T00:00:00Z" — '.' is 0x2E and 'Z' is 0x5A — which inverts the
+    order and swallows a review half a second NEWER than the clean verdict. That
+    is a blocker dropped in the unsafe direction, so the comparison runs on a
+    normalized 14-digit key rather than on the raw strings.
+
+    The REST API emits whole seconds for both fields today, so this is latent
+    rather than live. It is pinned because the cost of being wrong is a silently
+    merged finding, and because it is what makes the normalization load-bearing
+    rather than decorative: verified by mutation, replacing the key comparison
+    with a raw `$1 < clean` turns this test red while every other retraction test
+    stays green.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T00:00:00Z", "2026-08-17T00:00:00.500Z 555", clean_count=1
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, (
+        "a review half a second newer than the clean verdict was swallowed:\n"
+        f"{result.stdout}"
+    )
+
+
+def test_retraction_alone_never_exits_zero(tmp_path):
+    """Emptying the review list is not a verdict.
+
+    With the only review retracted and no clean summary counted, the head has NO
+    verdict: the gate must report UNKNOWN and hold, never fall through to the
+    clean path. This pins the safety property that retraction can only ever
+    reach exit 0 through the existing clean-signal funnel — it fails if anyone
+    adds a third `exit 0` for the empty-after-filtering case.
+    """
+    fx = retraction_fixture("2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555")
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, (
+        f"retraction alone opened the gate:\n{result.stdout}"
+    )
+    assert "UNKNOWN" in result.stdout, result.stdout
+
+
+def test_a_retracted_head_is_not_re_requested(tmp_path):
+    """A retracted review is still an answer, so Codex is not asked again.
+
+    Re-asking spends a review generation for nothing, and the review it produces
+    is NEWER than the clean verdict — the filter keeps it, and if it carries
+    findings it turns a head Codex just called clean red again.
+
+    This pins the OUTCOME. It deliberately does NOT discriminate between the raw
+    and the filtered read at the guard, and cannot: the guard runs before
+    CLEAN_TS is read, so the filter is inert there and the two reads are
+    indistinguishable on this path. That the guard nevertheless reads the raw
+    list — so the outcome holds by construction rather than by the accident of
+    where CLEAN_TS is read — is pinned by
+    test_the_anchor_guard_reads_the_unfiltered_reviews, which mutation confirms
+    is the test that bites when the read is swapped.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555", clean_count=1
+    )
+    result = run_gate(tmp_path, fx, action="submitted")
+    assert result.returncode == 0, result.stdout
+    calls = posted_bodies(tmp_path)
+    assert "-f body=" not in calls, f"re-requested a review for a retracted head:\n{calls}"
+
+
+def test_a_retracted_review_files_no_review_debt(tmp_path):
+    """A retracted finding blocks nothing, so it is not debt either.
+
+    Past the review budget a standing P1 stops blocking and is filed as review
+    debt — that is the point of the budget. A RETRACTED P1 is not a deferred
+    finding: Codex said it is not there, so filing it would record a finding
+    that no longer exists as work someone must do.
+
+    The converse lives in test_deferred_p1s_merge_and_are_filed_as_review_debt,
+    which must keep passing: an un-retracted P1 in a degraded round IS filed.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T01:00:00Z",
+        "2026-08-17T00:00:00Z 555",
+        clean_count=1,
+        prior=(OLD1, OLD2, OLD3),
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "Degraded" in result.stdout, result.stdout
+    calls = posted_bodies(tmp_path)
+    assert "-f title=" not in calls, (
+        f"a retracted finding was filed as review debt:\n{calls}"
+    )
 
 
 def posted_bodies(tmp_path):
