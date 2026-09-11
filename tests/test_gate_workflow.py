@@ -140,13 +140,24 @@ def test_gating_step_has_no_if_condition():
 
 
 def test_exactly_two_deliberate_exit_zero_paths():
-    """Every exit 0 must be one of the three documented bypasses.
+    """Every exit 0 must be one of the two documented bypasses.
 
-    Enumerated so that adding a fourth is a deliberate, reviewed act rather than
-    an accident: the fast-merge topic, a clean head-bound signal with no formal
-    review, and a head-bound review carrying no P1 marker.
+    Enumerated so that adding a third is a deliberate, reviewed act rather than
+    an accident: a clean head-bound signal with no formal review, and a
+    head-bound review carrying no blocking marker. (The repo-wide `fast-merge`
+    topic opt-out was cut — an unattributable opt-out is not a decision anyone
+    can review.)
+
+    Counted over CODE with comments stripped, and NOT anchored to the whole
+    line. The line-anchored form this test used to use missed `exit 0; fi`, so a
+    new bypass written on one line inside an `if` was invisible to it —
+    demonstrated by mutation while the retraction path was added, which is
+    exactly the change that most needed this count to hold.
     """
-    assert len(re.findall(r"^\s*exit 0\s*$", SCRIPT, re.M)) == 2
+    code = "\n".join(
+        ln for ln in SCRIPT.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert len(re.findall(r"\bexit 0\b", code)) == 2
 
 
 def test_every_verdict_read_goes_through_the_failing_api_wrapper():
@@ -214,7 +225,12 @@ def test_the_two_reads_that_decide_blockers_fail_hard():
         code = [ln for ln in tail if not ln.lstrip().startswith("#")]
         return "\n".join(code[:lines])
 
-    review_ids = code_after("review_ids_for_head() {", 4)
+    # The reviews read lives in review_rows_for_head(): the retraction filter
+    # needs the raw "<submitted_at> <id>" rows, and review_ids_for_head() is now
+    # the one-line projection of them. Asserting on the projection would find no
+    # api() call at all — the jq program must have exactly ONE home, so this
+    # follows it there rather than duplicating the call in both functions.
+    review_ids = code_after("review_rows_for_head() {", 4)
     assert 'api "repos/${REPO}/pulls/${PR}/reviews"' in review_ids
     assert "gh api" not in review_ids
 
@@ -317,6 +333,55 @@ def test_round_state_reads_fail_closed():
     block = SCRIPT[idx : idx + 800]
     assert "gh api" not in block, "round-state read bypasses the api() wrapper"
     assert block.count("api \"repos/") == 2
+
+
+def test_the_retraction_filter_matches_the_clean_signal_filter():
+    """A comment that can RETRACT a review must be one that could AUTHORISE it.
+
+    The retraction reads the newest head-bound clean verdict's timestamp with
+    its own jq program. Loosened relative to the one that COUNTS clean verdicts
+    — dropping the verbatim sentence, the head binding, or the contradictory-
+    marker test — it would let a comment that cannot release a head still delete
+    a blocking finding from it. The two are the same question asked for a
+    different field, so they are asserted equal here, condition by condition.
+    """
+    clean = SCRIPT[SCRIPT.index("codex_clean_comment_for_head() {") :][:600]
+    retract = SCRIPT[SCRIPT.index("CLEAN_TS=$(api") :][:600]
+    for name, block in (("clean-signal", clean), ("retraction", retract)):
+        for condition in (
+            r'contains(\"${CLEAN_VERDICT}\")',
+            r'contains(\"${HEAD_SHORT}\")',
+            r'test(\"${JQ_PATTERN}\") | not',
+        ):
+            assert condition in block, f"the {name} filter lost {condition}:\n{block}"
+
+    # And CLEAN_TS must NOT be refreshed inside the grace poll. That it was read
+    # once, before the poll, is what makes it <= the read moment — so a review
+    # published AFTER the clean signal is always strictly newer and survives.
+    # Refreshing it here would let a comment landing during the window retract a
+    # review landing in the same window, which is the race the window exists for.
+    grace = SCRIPT[
+        SCRIPT.index('GRACE="${GRACE_SECONDS:-90}"') : SCRIPT.index("SETTLE_SECONDS")
+    ]
+    assert grace, "the grace block was not found"
+    assert "CLEAN_TS" not in grace, "CLEAN_TS is refreshed inside the grace poll"
+
+
+def test_the_anchor_guard_reads_the_unfiltered_reviews():
+    """A retracted review is still an answer; Codex is not asked again for it.
+
+    Re-requesting spends a review generation for nothing, and the review it
+    produces is NEWER than the clean verdict — so the retraction filter keeps
+    it, and if it carries findings it turns a head Codex just called clean red
+    again. The guard therefore tests the RAW list.
+    """
+    line = next(
+        ln
+        for ln in SCRIPT.splitlines()
+        if "ANCHOR_ID" in ln and "-z" in ln and "review" in ln
+    )
+    assert "review_rows_for_head" in line, line
+    assert "review_ids_for_head" not in line, line
 
 
 def test_degraded_rounds_swap_only_the_marker_scan_pattern():
