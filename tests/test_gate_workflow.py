@@ -256,6 +256,36 @@ def test_the_two_reads_that_decide_blockers_fail_hard():
     assert "Failing toward blocking is the" in SCRIPT
 
 
+def test_the_attribution_read_excludes_the_reviewer_and_fails_hard():
+    """The request read feeding the retraction guard, in both directions.
+
+    EXCLUDING CODEX_BOT is load-bearing, not hygiene. Codex's own verdict bodies
+    carry a boilerplate <details> block that literally contains the phrase
+    `"@codex review"`, so a read matching the phrase without the author filter
+    counts every verdict as a request. The count then reaches 2 on any head Codex
+    has spoken about twice, the guard refuses EVERY retraction, and the feature
+    dies silently — stuck red on exactly the BoardAi#183 shape it exists to
+    release.
+
+    Fail-hard is the other half, for the same reason CLEAN_TS is: a swallowed
+    read yields an empty request list, which is indistinguishable from "one
+    request, unambiguous" and is the PERMISSIVE direction for a guard whose only
+    job is to narrow. The reaction lookups may swallow precisely because their
+    failure lands on "no verdict"; this one may not.
+    """
+    tail = SCRIPT[SCRIPT.index("REQ_TS=$(api"):].splitlines()
+    code = [ln for ln in tail if not ln.lstrip().startswith("#")]
+    read = "\n".join(code[:2])
+    # The quotes are shell-escaped in the source, so match the escaped form.
+    assert r'user.login != \"${CODEX_BOT}\"' in read, read
+    assert r'contains(\"@codex review\")' in read, read
+    assert "gh api" not in read, read
+
+    # And the guard actually consumes it, rather than the read being decorative.
+    assert '-v reqs="${REQ_TS:-}"' in SCRIPT
+    assert "if (qk == \"\" || qk < rk) n++" in SCRIPT
+
+
 
 def test_no_exit_zero_follows_a_blocker_or_unknown_verdict():
     """Walk the script and assert the terminal decision of each branch.

@@ -356,6 +356,22 @@ jobs:
           #   * a row whose timestamp does not parse is kept — an unknown
           #     ordering must never supersede a finding.
           #   * a TIE is kept: only a strictly older verdict is retracted.
+          #   * a finding is kept when TWO OR MORE requests predate it, because
+          #     then the clean signal is not attributable to one of them. This is
+          #     the third operand and the least obvious one. Ordering by
+          #     publication time assumes a verdict answers the request that
+          #     started LAST; with two requests in flight it answers whichever
+          #     Codex processed first, and an EARLIER request publishing clean
+          #     AFTER a later request published a P1 would retract a live
+          #     blocker. Reachable, not theoretical: the anchor guard suppresses
+          #     the gate's own second request for a head, so asking again means a
+          #     maintainer commenting `@codex review` — the route Codex's own
+          #     boilerplate advertises — and that does not serialize against the
+          #     gate's request. Observed on nerve-cloud#247, where a manual
+          #     request sat between the gate's anchor and Codex's re-emitted P1.
+          #     With one request the answer is unambiguous and retraction stands
+          #     (BoardAi#183: one anchor before the finding, the human's
+          #     re-request after it); with none it is likewise unambiguous.
           # Compared on a 14-digit key, because lexicographic order inverts when
           # one side carries fractional seconds ('.' sorts before 'Z').
           #
@@ -364,20 +380,32 @@ jobs:
           # window polling every 5s does not litter the pull request with twenty
           # duplicate annotations.
           retract_older_than_clean_verdict() {
-            awk -v clean="${CLEAN_TS:-}" '
+            awk -v clean="${CLEAN_TS:-}" -v reqs="${REQ_TS:-}" '
               function key(ts) {
                 if (ts !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return ""
                 return substr(ts,1,4) substr(ts,6,2) substr(ts,9,2) substr(ts,12,2) substr(ts,15,2) substr(ts,18,2)
               }
-              BEGIN { ck = key(clean) }
+              BEGIN { ck = key(clean); nreq = split(reqs, rq, "\n") }
               { if (NF == 0) next
                 if (ck == "") { print; next }
                 rk = key($1)
-                if (rk != "" && rk < ck) {
-                  print "Clean Codex verdict for this head at " clean " supersedes verdict " $NF " — its findings are not counted." > "/dev/stderr"
+                if (rk == "" || rk >= ck) { print; next }
+                # Strictly older than the clean verdict, so it is a retraction
+                # candidate — but only if that verdict is ATTRIBUTABLE. Count the
+                # requests predating THIS finding; two or more leaves the clean
+                # signal answerable to either one, and a request that started
+                # first and published last must not erase a live blocker. A
+                # request whose timestamp does not parse counts as predating: an
+                # unknown ordering may only narrow this rule, never widen it.
+                n = 0
+                for (i = 1; i <= nreq; i++) { qk = key(rq[i]); if (qk == "" || qk < rk) n++ }
+                if (n > 1) {
+                  print "Clean Codex verdict at " clean " does NOT retract verdict " $NF ": " n " review requests predate that verdict, so the clean signal is not attributable to one of them. The finding is kept." > "/dev/stderr"
+                  print
                   next
                 }
-                print }'
+                print "Clean Codex verdict for this head at " clean " supersedes verdict " $NF " — its findings are not counted." > "/dev/stderr"
+                next }'
           }
 
           # The verdict list: bare ids, one per line — the contract every caller
@@ -626,6 +654,23 @@ jobs:
           CLEAN_TS=$(api "repos/${REPO}/issues/${PR}/comments" \
             --jq ".[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .created_at" \
             | sort | tail -1)
+
+          # Every `@codex review` request that could have produced a clean
+          # verdict for this head: the gate's own anchors (authored by
+          # ANCHOR_AUTHOR through the request token, so a non-Codex login) and any
+          # a maintainer posted by hand. The attribution guard below compares each
+          # finding against the requests that PREDATE it, so this is read ONCE,
+          # here, for the same reason CLEAN_TS is: a request posted during the
+          # grace poll must not change the verdict of a finding that landed
+          # before it.
+          #
+          # Scoped to `created_at > HEAD_TIME` because a request made for an
+          # earlier head says nothing about this one — the same scoping the
+          # PR-level 👍 read already uses. Fail-hard through api(), like
+          # CLEAN_TS: a request list that silently read empty would read as
+          # "nothing to attribute", which is the PERMISSIVE direction.
+          REQ_TS=$(api "repos/${REPO}/issues/${PR}/comments" \
+            --jq ".[] | select(.user.login != \"${CODEX_BOT}\") | select(.body | contains(\"@codex review\")) | select(.created_at > \"${HEAD_TIME}\") | .created_at")
 
           # The reaction lookups below deliberately keep the raw `gh api ... ||
           # true` form rather than going through api(). They produce a CLEAN

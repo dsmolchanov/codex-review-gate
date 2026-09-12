@@ -635,8 +635,13 @@ def round_fixture(*prior, head_review: bool):
     return fx
 
 
-def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=()):
+def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=(), requests=()):
     """A head carrying `review_row` ("<submitted_at> <id>") and a clean verdict.
+
+    `requests` is the `@codex review` request-timestamp list `select(.body |
+    contains("@codex review"))` yields — what the attribution guard counts.
+    Empty models the fixture's usual head, which was reviewed without the gate
+    ever having to ask twice.
 
     Key order inside each route value is LOAD-BEARING: the stub answers with the
     first substring match in insertion order, and both routes below are read by
@@ -647,7 +652,9 @@ def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=()):
       `submitted_at`. Head review first, so each lands on its own value.
     * `issues/7/comments` — `capture(` is the round-state read, CLEAN_TS_KEY is
       the clean-timestamp read, and the verbatim sentence is last because the
-      round-state read matches it too and must not be answered by it.
+      round-state read matches it too and must not be answered by it. The
+      request read goes FIRST: its filter ends in `.created_at` too, and
+      CLEAN_TS_KEY is a substring key that would otherwise answer it.
     """
     fx = base_fixture()
     fx["routes"]["pulls/7/reviews"] = {
@@ -660,6 +667,7 @@ def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=()):
         "*": "",
     }
     comments = {}
+    comments["@codex review"] = "\n".join(requests)
     if prior:
         comments["capture("] = verdict_heads(*prior)
     comments[CLEAN_TS_KEY] = clean_ts
@@ -804,6 +812,98 @@ def test_mixed_timestamp_precision_cannot_swallow_a_newer_review(tmp_path):
     assert result.returncode != 0, (
         "a review half a second newer than the clean verdict was swallowed:\n"
         f"{result.stdout}"
+    )
+
+
+def test_two_requests_before_the_finding_block_the_retraction(tmp_path):
+    """Publication order is not causal order — the inversion Codex found.
+
+    An earlier request can still be in flight when a later request publishes a
+    P1, and then answer clean AFTERWARDS. Ordering by publication time alone
+    reads that late clean verdict as retracting a finding it never addressed,
+    and the merge passes over a live blocker.
+
+    Reachable in practice, not in theory: the gate's own anchor guard suppresses
+    the GATE's second request for a head, so the documented way to ask again —
+    commenting `@codex review`, which Codex's own boilerplate advertises — is the
+    only route, and it is unattributable. This repository's own nerve-cloud#247
+    carries exactly that shape: the gate's anchor at 21:02:24Z and a manual
+    request at 10:34:51Z, both predating Codex's re-emitted P1 at 10:38:14Z.
+
+    With TWO requests predating the finding, the clean signal could be the answer
+    to either, so it is not attributable and the finding is KEPT.
+
+    Fails before the attribution guard: the plainly-older review is retracted,
+    the review list empties, and — with the clean path live via clean_count — the
+    run reaches exit 0 on an open P1.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T02:00:00Z",
+        "2026-08-17T01:00:00Z 555",
+        clean_count=1,
+        requests=("2026-08-17T00:00:00Z", "2026-08-17T00:30:00Z"),
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, (
+        "a clean verdict retracted a finding while two requests predated it, so "
+        f"the clean signal was never attributable to one of them:\n{result.stdout}"
+    )
+    assert "supersedes" not in result.stdout + result.stderr, (
+        f"the finding was retracted anyway:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_one_request_before_the_finding_still_retracts(tmp_path):
+    """The guard must not cost the case the retraction exists for.
+
+    BoardAi#183 — the incident this rule was written for — has exactly ONE
+    request predating the finding: the gate's own anchor at 16:37:11Z, with the
+    human's re-request at 16:41:26Z arriving AFTER the 16:39:51Z P1. The count is
+    therefore 1, the clean verdict IS attributable, and the retraction must still
+    fire. A guard that blocked here would re-break the incident it was written to
+    fix, which is why this test is the counterweight to the inversion above.
+
+    Passes before the guard as well as after, by construction: it pins that the
+    guard is a narrowing of the old rule and not a replacement for it.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T02:00:00Z",
+        "2026-08-17T01:00:00Z 555",
+        clean_count=1,
+        requests=("2026-08-17T00:30:00Z",),
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, (
+        "a single request predating the finding made the clean verdict "
+        f"unattributable, re-breaking BoardAi#183:\n{result.stdout}"
+    )
+    assert "supersedes" in result.stdout + result.stderr, (
+        f"the retraction was not reported:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_an_unreadable_request_timestamp_counts_as_predating(tmp_path):
+    """An unknown request ordering must narrow the rule, never widen it.
+
+    A request whose timestamp does not parse cannot be shown to postdate the
+    finding, so it is counted as predating one. Counting it the other way would
+    let a malformed row LOWER the request count, which is the direction that
+    retracts more — the same fail-open the unparsable CLEAN_TS guard exists to
+    refuse, one operand over.
+
+    Fails before the guard: the count is never taken, the older review is
+    retracted, and the run exits 0 on an open P1.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T02:00:00Z",
+        "2026-08-17T01:00:00Z 555",
+        clean_count=1,
+        requests=("9001", "2026-08-17T00:30:00Z"),
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode != 0, (
+        "an unparsable request timestamp lowered the request count and let the "
+        f"finding be retracted:\n{result.stdout}"
     )
 
 
