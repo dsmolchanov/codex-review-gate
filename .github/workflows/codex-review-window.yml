@@ -98,23 +98,17 @@ on:
 # asserts the count and the static invariants; `tests/test_gate_behavior.py`
 # EXECUTES this script against a stubbed GitHub API and asserts the exit code on
 # each path, because exit 0 means "this pull request may merge".
-#   1. a head-bound clean signal with no SURVIVING formal review (Codex 👍 on
+#   1. a head-bound clean signal with no formal review (Codex 👍 on
 #      this head's anchor, or the verbatim "Codex Review: Didn't find any major
 #      issues." summary naming this head and carrying no P0/P1 marker),
-#      re-checked for a late formal review before it is honoured. A formal
-#      review OLDER than the clean verdict does not survive it when a review
-#      request was made BETWEEN the two: Codex re-reviewed this same head and
-#      retracted the finding, and holding the merge on a retracted finding leaves
-#      the only escape the "push to shake a verdict loose" this file forbids.
-#      Without such a request the clean verdict answers a concurrent generation
-#      rather than the finding, and the finding stands. See
-#      retract_older_than_clean_verdict();
-#   2. a head-bound review carrying no blocking marker — P0/P1/[BLOCKER] on
-#      full rounds, P0 only once the review budget is spent.
+#      re-checked for a late formal review before it is honoured;
+#   2. every head-bound review carries no blocking marker — P0/P1/[BLOCKER]
+#      on full rounds, P0 only once the review budget is spent.
+# Clean summaries never retract formal findings. Concurrent reviews can publish
+# out of order, and neither a request timestamp nor elapsed time proves which
+# request produced a summary. All reviews of this head remain in the scan.
 # Everything else — no verdict, quota exhausted, any GitHub API failure, an
-# unresolvable or superseded head, any open blocker — exits 1. Retraction alone
-# is not a verdict: emptying the review list still reaches path 1 only through a
-# counted clean signal, never on its own.
+# unresolvable or superseded head, any open blocker — exits 1.
 #
 # There is NO repo-wide opt-out. A `fast-merge` repo topic disabled this gate
 # for every PR, indefinitely and unattributably; a deliberate opt-out needs an
@@ -330,114 +324,21 @@ jobs:
           # read, so it fails hard — an API error returning nothing here would
           # look exactly like "Codex found no findings".
           #
-          # RAW rows — "<submitted_at> <id>" — because the retraction filter
-          # below must order each review against a head-bound clean verdict. The
-          # verdict list is review_ids_for_head(); this function exists so the jq
-          # program has exactly one home.
+          # Raw rows are shared by the anchor guard and the verdict scan.
+          # The scan projects ids without interpreting publication timestamps.
           review_rows_for_head() {
             api "repos/${REPO}/pulls/${PR}/reviews" \
               --jq "[.[] | select(.user.login == \"${CODEX_BOT}\" and .commit_id == \"${HEAD_SHA}\") | \"\(.submitted_at) \(.id)\"] | .[]"
           }
 
-          # A head-bound clean verdict RETRACTS the findings of every head-bound
-          # verdict older than it: Codex re-reviewed this same head and took the
-          # finding back. Observed on BoardAi#183, where a retracted P1 held the
-          # merge and the only escape was the "push to shake a verdict loose"
-          # this file's own error text forbids. It is not a waiver mechanism: it
-          # reads the same verbatim sentence that already releases a review-less
-          # head, and it can only turn the gate green on a head Codex itself last
-          # spoke about as clean.
-          #
-          # Everything unproven is KEPT, in BOTH operands:
-          #   * a CLEAN_TS that is not a timestamp disables the filter entirely.
-          #     Dropping rows on an unreadable operand is a fail-OPEN, and not a
-          #     hypothetical one: jq's `max` yields the literal string "null" for
-          #     an empty array and awk compares "2026-..." < "null" as strings,
-          #     so the entire review list would be swallowed and the gate would
-          #     exit 0 on an open P1. That is why the read emits one line per
-          #     match and aggregates with tail, AND why this guard exists.
-          #   * a row whose timestamp does not parse is kept — an unknown
-          #     ordering must never supersede a finding.
-          #   * a TIE is kept: only a strictly older verdict is retracted.
-          #   * a finding is kept unless a review request was made BETWEEN it and
-          #     the clean verdict. This is the third operand and the least obvious
-          #     one. Ordering by publication time assumes a verdict answers the
-          #     request that started LAST, and nothing in the API says that: with
-          #     two generations in flight Codex answers whichever it processed
-          #     first, so an EARLIER request publishing clean AFTER a later request
-          #     published a P1 would retract a live blocker. Observed on
-          #     nerve-cloud#247, where a manual request sat between the gate's
-          #     anchor and Codex's re-emitted P1.
-          #
-          #     A COUNT of request comments cannot decide this, which is why this
-          #     operand is a window and not a number. Codex reviews a pull request
-          #     when it is OPENED, and that generation leaves no request comment
-          #     behind: on BoardAi#183 Codex created its summary at 16:21:18Z,
-          #     sixteen minutes before the first request comment existed at all.
-          #     The gate anchors later heads only — `opened` is deliberately absent
-          #     from the request switch — so a head can carry a generation nobody
-          #     commented for, and a request made by hand while that generation is
-          #     still running makes two. A count of one then reads as attributable
-          #     and retracts a live P1. No count over comments is evidence about
-          #     generations, because the automatic trigger is invisible to a
-          #     comment query.
-          #
-          #     A request made AFTER the finding is the observable that shows the
-          #     clean verdict answers a re-review of THAT finding, and it assumes
-          #     nothing about how many generations exist. BoardAi#183 has exactly
-          #     that shape: the gate's anchor at 16:37:11Z precedes the 16:39:51Z
-          #     P1, and the human's re-request at 16:41:26Z falls between it and
-          #     the 16:44:09Z clean verdict.
-          # Compared on a 14-digit key, because lexicographic order inverts when
-          # one side carries fractional seconds ('.' sorts before 'Z').
-          #
-          # The notice repeats once per poll while the retraction stands. It is a
-          # plain line rather than a ::notice:: annotation so that a 90s grace
-          # window polling every 5s does not litter the pull request with twenty
-          # duplicate annotations.
-          retract_older_than_clean_verdict() {
-            # The request list travels through the environment, NOT `-v`. BWK awk
-            # lexes a -v value as SOURCE TEXT, so the newline separating two
-            # request timestamps is a syntax error rather than data: the function
-            # aborts instead of deciding, and it aborts on exactly the heads that
-            # carry two requests — the ones this operand exists for. ENVIRON
-            # carries the bytes through unlexed.
-            REQ_TS="${REQ_TS:-}" awk -v clean="${CLEAN_TS:-}" '
-              function key(ts) {
-                if (ts !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return ""
-                return substr(ts,1,4) substr(ts,6,2) substr(ts,9,2) substr(ts,12,2) substr(ts,15,2) substr(ts,18,2)
-              }
-              BEGIN { ck = key(clean); nq = split(ENVIRON["REQ_TS"], rq, "\n") }
-              { if (NF == 0) next
-                if (ck == "") { print; next }
-                rk = key($1)
-                if (rk == "" || rk >= ck) { print; next }
-                # Strictly older than the clean verdict, so it is a retraction
-                # candidate — but only if a request was made IN THE WINDOW
-                # between them, which is the only observable that shows the clean
-                # verdict answers a re-review of THIS finding rather than the tail
-                # of a concurrent generation. A request that does not parse cannot
-                # be placed in the window and so cannot answer it: an unknown
-                # ordering may only narrow this rule, never widen it. Keep this
-                # comment free of apostrophes: the program is single-quoted, so
-                # one would close it and the rest would be read as shell.
-                found = 0
-                for (i = 1; i <= nq; i++) { qk = key(rq[i]); if (qk != "" && qk > rk && qk < ck) { found = 1; break } }
-                if (!found) {
-                  print "Clean Codex verdict at " clean " does NOT retract verdict " $NF ": no review request was made between the finding and that verdict, so the clean signal answers a different review generation. The finding is kept." > "/dev/stderr"
-                  print
-                  next
-                }
-                print "Clean Codex verdict for this head at " clean " supersedes verdict " $NF " — its findings are not counted." > "/dev/stderr"
-                next }'
-          }
-
-          # The verdict list: bare ids, one per line — the contract every caller
-          # below already reads. NF > 0 and not NF > 1: a row carrying no
-          # timestamp is still a review of this head, and dropping it here would
-          # silently un-review the head.
+          # A clean summary cannot retract a formal finding. Automatic and
+          # requested reviews can run concurrently, and a request made after a
+          # finding does not prove that a later summary answers it. The request
+          # may even have been rejected. Keep every review of this head until
+          # an explicit causal signal is available; timestamps cannot supply it.
+          # Missing or unreadable timestamps still leave a review id to scan.
           review_ids_for_head() {
-            review_rows_for_head | retract_older_than_clean_verdict | awk 'NF > 0 {print $NF}'
+            review_rows_for_head | awk 'NF > 0 {print $NF}'
           }
 
           # The marker is predictable, so ownership is what makes an anchor
@@ -553,18 +454,8 @@ jobs:
           # synchronize run did get there first.
           case "${ACTION}" in
             synchronize|reopened|ready_for_review|submitted)
-              # The RAW reviews, deliberately not the retracted view. This asks
-              # a DIFFERENT question from the verdict list — "has Codex answered
-              # for this head at all?" — and a retracted review is still an
-              # answer. Re-asking spends a review generation for nothing, and
-              # the review it produces is NEWER than the clean verdict, so the
-              # filter keeps it and it can turn a head Codex called clean red.
-              #
-              # Reading the raw list also makes the outcome independent of where
-              # CLEAN_TS is read: today it is read later, so the filter is inert
-              # here either way, and this line is what keeps that from becoming
-              # load-bearing. Pinned by
-              # test_the_anchor_guard_reads_the_unfiltered_reviews.
+              # A head with a completed formal review already has an answer.
+              # Re-running the gate must not spend another review generation.
               if [ -z "${ANCHOR_ID}" ] && [ -z "$(review_rows_for_head)" ]; then
                 # Three request shapes, one per round state. Round 1 keeps the
                 # posted text byte-identical to CODEX_INVENTORY_REQUEST in
@@ -650,59 +541,6 @@ jobs:
               --jq "[.[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .id] | .[]" \
               | wc -l | tr -d ' '
           }
-
-          # The newest head-bound clean verdict's timestamp — what the retraction
-          # filter orders each review against.
-          #
-          # The filter below MUST stay identical to the one in
-          # codex_clean_comment_for_head() above: a comment that is allowed to
-          # RETRACT a review has to be one that could equally have AUTHORISED
-          # this head, no looser and no stricter. The two are asserted equal by
-          # tests/test_gate_workflow.py.
-          #
-          # Read ONCE per run, here — after the debounce and the head re-read, and
-          # before the first filtered read. It must NOT be refreshed inside the
-          # grace poll, and that is load-bearing rather than incidental: CLEAN_TS
-          # is read at a moment T and is therefore <= T, so a review published
-          # AFTER the clean signal has submitted_at > T >= CLEAN_TS and survives
-          # the strictly-older test by construction. That is what keeps the grace
-          # window — which exists because a formal review lands moments after the
-          # summary that announces it — working. Refreshing it mid-poll would let
-          # a comment landing during the window retract a review landing in the
-          # same window, which is the race this file exists to lose no more.
-          #
-          # One line per match, aggregated with `tail -1`, NOT jq's `max`: with
-          # --paginate the filter runs once per page, and `max` over an empty
-          # array prints the literal string "null", which the comparator would
-          # read as newer than every review on the pull request.
-          CLEAN_TS=$(api "repos/${REPO}/issues/${PR}/comments" \
-            --jq ".[] | select(.user.login == \"${CODEX_BOT}\") | select(.body | contains(\"${CLEAN_VERDICT}\") and contains(\"${HEAD_SHORT}\")) | select(.body | test(\"${JQ_PATTERN}\") | not) | .created_at" \
-            | sort | tail -1)
-
-          # Every `@codex review` request on the pull request: the gate's own
-          # anchors (authored by ANCHOR_AUTHOR through the request token, so a
-          # non-Codex login) and any a maintainer posted by hand. The attribution
-          # guard below asks whether one of them falls in the window between a
-          # finding and a clean verdict, so this is read ONCE, here, for the same
-          # reason CLEAN_TS is: a request posted during the grace poll must not
-          # change the verdict of a finding that landed before it.
-          #
-          # Deliberately NOT scoped by HEAD_TIME. HEAD_TIME is the commit's
-          # committer date, which is not when the commit appeared in the pull
-          # request: a commit written earlier and pushed later carries a HEAD_TIME
-          # older than requests made for the PREVIOUS head, and a scoped read
-          # imports them. The window needs no clock of its own — it is bounded by
-          # a finding and a clean verdict that are both bound to THIS head, so it
-          # lies inside this head's life by construction.
-          #
-          # Fail-hard through api(), like CLEAN_TS, so a broken read is visible
-          # rather than silent. Note the direction has flipped with the window
-          # rule: an EMPTY request list now keeps findings rather than dropping
-          # them, so a swallowed failure would stall the gate red on a head Codex
-          # has cleared — the incident this rule exists to fix, made permanent and
-          # indistinguishable from "nobody asked again".
-          REQ_TS=$(api "repos/${REPO}/issues/${PR}/comments" \
-            --jq ".[] | select(.user.login != \"${CODEX_BOT}\") | select(.body | contains(\"@codex review\")) | .created_at")
 
           # The reaction lookups below deliberately keep the raw `gh api ... ||
           # true` form rather than going through api(). They produce a CLEAN
@@ -881,7 +719,7 @@ jobs:
           fi
 
           # ---------------------------------------------------------------
-          # Deliberate bypass 1 of 2: a clean head-bound signal, no SURVIVING
+          # Deliberate bypass 1 of 2: a clean head-bound signal, no formal
           # review.
           #
           # The loop above breaks the instant a clean signal appears, and a
@@ -892,12 +730,8 @@ jobs:
           # decided. Wait, then re-query — a review found now is authoritative
           # and the clean signal does not override it.
           #
-          # The one thing that does NOT reach here is a review OLDER than the
-          # clean verdict: review_ids_for_head() has already retracted it, so
-          # RIDS is empty for that head and the wait above is skipped entirely.
-          # "A review found now" means one published after the clean signal —
-          # which is why CLEAN_TS is read once, before this poll, and must never
-          # be refreshed inside it.
+          # Any formal review of this head, regardless of publication order,
+          # takes precedence over the clean signal and enters the marker scan.
           # ---------------------------------------------------------------
           # POLL across the whole window rather than checking once at the end.
           # A single `sleep 15` was shorter than the lag recorded two lines above:
