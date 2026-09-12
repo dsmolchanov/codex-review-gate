@@ -639,9 +639,10 @@ def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=(), request
     """A head carrying `review_row` ("<submitted_at> <id>") and a clean verdict.
 
     `requests` is the `@codex review` request-timestamp list `select(.body |
-    contains("@codex review"))` yields — what the attribution guard counts.
-    Empty models the fixture's usual head, which was reviewed without the gate
-    ever having to ask twice.
+    contains("@codex review"))` yields — the timestamps the attribution guard
+    reads to ask whether a request was made BETWEEN the finding and the clean
+    verdict. Empty means nobody asked again after the finding, which is the
+    common case and retracts nothing.
 
     Key order inside each route value is LOAD-BEARING: the stub answers with the
     first substring match in insertion order, and both routes below are read by
@@ -699,9 +700,20 @@ def retraction_fixture(clean_ts, review_row, *, clean_count=0, prior=(), request
 
 
 def test_a_clean_verdict_retracts_an_older_formal_review(tmp_path):
-    """The BoardAi#183 regression: the retracted P1 must stop holding the merge."""
+    """The BoardAi#183 regression: the retracted P1 must stop holding the merge.
+
+    The request at 00:30 is the human re-asking AFTER the finding, and it is what
+    makes the clean verdict attributable to a re-review of it — the same shape the
+    incident has, where the re-request at 16:41:26Z sits between the 16:39:51Z P1
+    and the 16:44:09Z clean verdict. Without it this fixture would model a
+    concurrent generation answering a different question, which the rule below
+    deliberately keeps.
+    """
     fx = retraction_fixture(
-        "2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555", clean_count=1
+        "2026-08-17T01:00:00Z",
+        "2026-08-17T00:00:00Z 555",
+        clean_count=1,
+        requests=("2026-08-17T00:30:00Z",),
     )
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, (
@@ -738,8 +750,15 @@ def test_an_unparsable_clean_timestamp_retracts_nothing(tmp_path):
     that version turns this test red on the "9001" and "null" cases.
     """
     for clean_ts in ("9001", "null", ""):
+        # The request is what makes this bite: it satisfies the window, so the
+        # unparsable CLEAN_TS is the ONLY thing left holding the finding. Without
+        # it the rule keeps the review for a second reason and the shape check
+        # could be deleted with this test still green.
         fx = retraction_fixture(
-            clean_ts, "2026-08-17T00:00:00Z 555", clean_count=1
+            clean_ts,
+            "2026-08-17T00:00:00Z 555",
+            clean_count=1,
+            requests=("2026-08-17T00:30:00Z",),
         )
         result = run_gate(tmp_path, fx)
         assert result.returncode != 0, (
@@ -826,16 +845,15 @@ def test_two_requests_before_the_finding_block_the_retraction(tmp_path):
     Reachable in practice, not in theory: the gate's own anchor guard suppresses
     the GATE's second request for a head, so the documented way to ask again —
     commenting `@codex review`, which Codex's own boilerplate advertises — is the
-    only route, and it is unattributable. This repository's own nerve-cloud#247
-    carries exactly that shape: the gate's anchor at 21:02:24Z and a manual
-    request at 10:34:51Z, both predating Codex's re-emitted P1 at 10:38:14Z.
+    only route. This repository's own nerve-cloud#247 carries exactly that shape:
+    the gate's anchor at 21:02:24Z and a manual request at 10:34:51Z, both
+    predating Codex's re-emitted P1 at 10:38:14Z. The clean verdict's answer,
+    whenever it lands, belongs to a generation that started before the finding.
 
-    With TWO requests predating the finding, the clean signal could be the answer
-    to either, so it is not attributable and the finding is KEPT.
-
-    Fails before the attribution guard: the plainly-older review is retracted,
-    the review list empties, and — with the clean path live via clean_count — the
-    run reaches exit 0 on an open P1.
+    Both requests predate the finding, so NEITHER is in the window between it and
+    the clean verdict, and the finding is KEPT. The count is not what decides it:
+    the same two requests with a third one after the finding DO retract, which is
+    the counterweight test below.
     """
     fx = retraction_fixture(
         "2026-08-17T02:00:00Z",
@@ -845,26 +863,71 @@ def test_two_requests_before_the_finding_block_the_retraction(tmp_path):
     )
     result = run_gate(tmp_path, fx)
     assert result.returncode != 0, (
-        "a clean verdict retracted a finding while two requests predated it, so "
-        f"the clean signal was never attributable to one of them:\n{result.stdout}"
+        "a clean verdict retracted a finding with no request made after that "
+        f"finding, so it answered a different generation:\n{result.stdout}"
     )
     assert "supersedes" not in result.stdout + result.stderr, (
         f"the finding was retracted anyway:\n{result.stdout}\n{result.stderr}"
     )
 
 
-def test_one_request_before_the_finding_still_retracts(tmp_path):
-    """The guard must not cost the case the retraction exists for.
+def test_a_request_after_the_finding_retracts_it(tmp_path):
+    """The counterweight: the case the retraction exists for must still fire.
 
-    BoardAi#183 — the incident this rule was written for — has exactly ONE
-    request predating the finding: the gate's own anchor at 16:37:11Z, with the
-    human's re-request at 16:41:26Z arriving AFTER the 16:39:51Z P1. The count is
-    therefore 1, the clean verdict IS attributable, and the retraction must still
-    fire. A guard that blocked here would re-break the incident it was written to
-    fix, which is why this test is the counterweight to the inversion above.
+    BoardAi#183 is faithful here, and the shape matters: the gate's anchor at
+    16:37:11Z PRECEDES the 16:39:51Z P1, and the human's re-request at 16:41:26Z
+    lands BETWEEN that P1 and the 16:44:09Z clean verdict. That request after the
+    finding is the observable evidence that the clean verdict answers a re-review
+    OF THAT FINDING. Drop it and the fixture stops modelling the incident — it
+    becomes the inversion below, where the clean verdict is a concurrent
+    generation's tail and must not retract anything.
 
-    Passes before the guard as well as after, by construction: it pins that the
-    guard is a narrowing of the old rule and not a replacement for it.
+    Both requests are present, so this also pins that the rule is not a count:
+    the older anchor neither helps nor hurts once a request exists in the window.
+    """
+    fx = retraction_fixture(
+        "2026-08-17T02:00:00Z",
+        "2026-08-17T01:00:00Z 555",
+        clean_count=1,
+        requests=("2026-08-17T00:30:00Z", "2026-08-17T01:30:00Z"),
+    )
+    result = run_gate(tmp_path, fx)
+    assert result.returncode == 0, (
+        "a request between the finding and the clean verdict failed to make the "
+        f"clean verdict attributable, re-breaking BoardAi#183:\n{result.stdout}"
+    )
+    assert "supersedes" in result.stdout + result.stderr, (
+        f"the retraction was not reported:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_a_clean_verdict_with_no_request_after_the_finding_keeps_it(tmp_path):
+    """A request COMMENT is not evidence of how many review GENERATIONS exist.
+
+    Codex reviews a pull request when it is OPENED, and that generation leaves no
+    request comment — it leaves a summary. BoardAi#183 shows it plainly: Codex
+    created the summary at 16:21:18Z, sixteen minutes before the first request
+    comment existed at all. The gate anchors LATER heads only, because `opened`
+    is deliberately absent from its request switch, so the automatic generation
+    is the only thing reviewing a freshly opened head — and a request made by
+    hand while it is still running makes that two generations behind one comment.
+
+    So a count over comments cannot be repaired by widening the count: the
+    automatic trigger is invisible to a comment query, and with one request
+    comment the count reads 1 whatever the real number of generations is. If the
+    automatic generation is still running when the requested generation publishes
+    a P1, it can answer clean AFTERWARDS — and a count of one retracts a live
+    blocker. The visible comment list cannot tell that case apart from the good
+    one, because in both there is exactly one request before the finding.
+
+    What is observable is a request made AFTER the finding. It is the only thing
+    that shows the clean verdict answers a re-review of that finding rather than
+    a concurrent generation's tail, and it costs no assumption about how many
+    generations exist.
+
+    Fails before the rule: the single earlier request satisfied the count, the
+    plainly-older review was retracted, and — with clean_count live — the run
+    reached exit 0 on an open P1.
     """
     fx = retraction_fixture(
         "2026-08-17T02:00:00Z",
@@ -873,37 +936,39 @@ def test_one_request_before_the_finding_still_retracts(tmp_path):
         requests=("2026-08-17T00:30:00Z",),
     )
     result = run_gate(tmp_path, fx)
-    assert result.returncode == 0, (
-        "a single request predating the finding made the clean verdict "
-        f"unattributable, re-breaking BoardAi#183:\n{result.stdout}"
+    assert result.returncode != 0, (
+        "a clean verdict landed after the finding with no request in between, so "
+        "nothing shows it answers a re-review of that finding rather than a "
+        f"concurrent generation:\n{result.stdout}"
     )
-    assert "supersedes" in result.stdout + result.stderr, (
-        f"the retraction was not reported:\n{result.stdout}\n{result.stderr}"
+    assert "supersedes" not in result.stdout + result.stderr, (
+        f"the finding was retracted anyway:\n{result.stdout}\n{result.stderr}"
     )
 
 
-def test_an_unreadable_request_timestamp_counts_as_predating(tmp_path):
+def test_an_unreadable_request_timestamp_cannot_stand_in_for_one(tmp_path):
     """An unknown request ordering must narrow the rule, never widen it.
 
-    A request whose timestamp does not parse cannot be shown to postdate the
-    finding, so it is counted as predating one. Counting it the other way would
-    let a malformed row LOWER the request count, which is the direction that
-    retracts more — the same fail-open the unparsable CLEAN_TS guard exists to
-    refuse, one operand over.
-
-    Fails before the guard: the count is never taken, the older review is
-    retracted, and the run exits 0 on an open P1.
+    The rule asks whether a request was made IN A WINDOW, so a timestamp that
+    does not parse cannot be placed in it and cannot answer the question. Here it
+    is the only request there is, and it must leave the finding standing — the
+    same fail-open the unparsable CLEAN_TS guard refuses, one operand over. The
+    permissive reading would be to assume a malformed row belongs to the window,
+    which is the direction that retracts more.
     """
     fx = retraction_fixture(
         "2026-08-17T02:00:00Z",
         "2026-08-17T01:00:00Z 555",
         clean_count=1,
-        requests=("9001", "2026-08-17T00:30:00Z"),
+        requests=("9001",),
     )
     result = run_gate(tmp_path, fx)
     assert result.returncode != 0, (
-        "an unparsable request timestamp lowered the request count and let the "
-        f"finding be retracted:\n{result.stdout}"
+        "an unparsable request timestamp was read as a request made after the "
+        f"finding, retracting it:\n{result.stdout}"
+    )
+    assert "supersedes" not in result.stdout + result.stderr, (
+        f"the finding was retracted anyway:\n{result.stdout}\n{result.stderr}"
     )
 
 
@@ -916,7 +981,11 @@ def test_retraction_alone_never_exits_zero(tmp_path):
     reach exit 0 through the existing clean-signal funnel — it fails if anyone
     adds a third `exit 0` for the empty-after-filtering case.
     """
-    fx = retraction_fixture("2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555")
+    fx = retraction_fixture(
+        "2026-08-17T01:00:00Z",
+        "2026-08-17T00:00:00Z 555",
+        requests=("2026-08-17T00:30:00Z",),
+    )
     result = run_gate(tmp_path, fx)
     assert result.returncode != 0, (
         f"retraction alone opened the gate:\n{result.stdout}"
@@ -941,7 +1010,10 @@ def test_a_retracted_head_is_not_re_requested(tmp_path):
     is the test that bites when the read is swapped.
     """
     fx = retraction_fixture(
-        "2026-08-17T01:00:00Z", "2026-08-17T00:00:00Z 555", clean_count=1
+        "2026-08-17T01:00:00Z",
+        "2026-08-17T00:00:00Z 555",
+        clean_count=1,
+        requests=("2026-08-17T00:30:00Z",),
     )
     result = run_gate(tmp_path, fx, action="submitted")
     assert result.returncode == 0, result.stdout
@@ -965,7 +1037,17 @@ def test_a_retracted_review_files_no_review_debt(tmp_path):
         "2026-08-17T00:00:00Z 555",
         clean_count=1,
         prior=(OLD1, OLD2, OLD3),
+        requests=("2026-08-17T00:30:00Z",),
     )
+    # The inline body must be a RECORD, not a bare sentence. review_debt.py plans
+    # a filing from the finding's own title, and a body it cannot extract one from
+    # yields "filed 0" whether or not the review was retracted — an assertion that
+    # then holds for the wrong reason and would survive the rule being deleted.
+    # This is the fixture shape the converse test uses.
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
+        "*": "",
+    }
     result = run_gate(tmp_path, fx)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert "Degraded" in result.stdout, result.stdout

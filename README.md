@@ -21,14 +21,29 @@ budget never overrides a missing verdict.
 **A clean verdict retracts older findings on the same head.** Codex answers the
 same commit twice: a formal review carrying what it found, then — once the
 finding is argued away — the verbatim clean sentence naming that same commit. A
-head-bound clean verdict therefore supersedes every head-bound verdict on that
-head that is **strictly older** than it. Ties keep the finding, an unreadable
-timestamp keeps the finding, and a review published *after* the clean signal is
-untouched and still decides the merge. Retraction is not a waiver: it reads the
-same verbatim sentence that already releases a review-less head, and it can only
-turn the gate green on a head Codex itself last spoke about as clean. Without it
-the only escape from a retracted finding is pushing a new commit — the "shake a
-verdict loose" this gate's own error text forbids.
+head-bound clean verdict therefore supersedes a head-bound verdict on that head
+that is **strictly older** than it, provided a review request was made **between
+the two**. Ties keep the finding, an unreadable timestamp keeps the finding, and
+a review published *after* the clean signal is untouched and still decides the
+merge.
+
+That request in between is what makes the retraction attributable, and it cannot
+be replaced by counting requests. Codex reviews a pull request when it is opened,
+and that generation leaves no request comment behind — it leaves a summary. The
+gate anchors later heads only, because `opened` is deliberately absent from its
+request switch, so a freshly opened head is reviewed by a generation no comment
+records, and a request made by hand while it is still running makes that two. A
+count of one would read such a head as attributable, and the automatic generation
+answering clean after the requested one published a P1 would then retract a live
+blocker. A request made after the finding is the only observable that shows
+the clean verdict answers a re-review of *that* finding, and it assumes nothing
+about how many generations exist.
+
+Retraction is not a waiver: it reads the same verbatim sentence that already
+releases a review-less head, and it can only turn the gate green on a head Codex
+itself last spoke about as clean. Without it the only escape from a retracted
+finding is pushing a new commit — the "shake a verdict loose" this gate's own
+error text forbids.
 
 It exists as a standalone repository because a gate distributed as *content* is
 reviewed once per consumer. Copying the body into eight repositories put the

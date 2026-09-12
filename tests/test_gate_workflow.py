@@ -262,16 +262,17 @@ def test_the_attribution_read_excludes_the_reviewer_and_fails_hard():
     EXCLUDING CODEX_BOT is load-bearing, not hygiene. Codex's own verdict bodies
     carry a boilerplate <details> block that literally contains the phrase
     `"@codex review"`, so a read matching the phrase without the author filter
-    counts every verdict as a request. The count then reaches 2 on any head Codex
-    has spoken about twice, the guard refuses EVERY retraction, and the feature
-    dies silently — stuck red on exactly the BoardAi#183 shape it exists to
-    release.
+    lets Codex artifacts enter the request list. Under the window rule such an
+    artifact landing between a finding and a clean verdict would stand in for a
+    request nobody made and justify a retraction — the guard exists to require
+    that a HUMAN asked again, so the reviewer must not be able to answer for one.
 
-    Fail-hard is the other half, for the same reason CLEAN_TS is: a swallowed
-    read yields an empty request list, which is indistinguishable from "one
-    request, unambiguous" and is the PERMISSIVE direction for a guard whose only
-    job is to narrow. The reaction lookups may swallow precisely because their
-    failure lands on "no verdict"; this one may not.
+    Fail-hard is the other half, for the same reason CLEAN_TS is: a broken read
+    must be visible rather than silent. The direction flipped when the guard
+    became a window instead of a count — an EMPTY request list now KEEPS findings,
+    so a swallowed failure would stall the gate red on a head Codex has cleared,
+    which is the BoardAi#183 incident made permanent. The reaction lookups may
+    swallow because their failure lands on "no verdict"; this one may not.
     """
     tail = SCRIPT[SCRIPT.index("REQ_TS=$(api"):].splitlines()
     code = [ln for ln in tail if not ln.lstrip().startswith("#")]
@@ -280,10 +281,38 @@ def test_the_attribution_read_excludes_the_reviewer_and_fails_hard():
     assert r'user.login != \"${CODEX_BOT}\"' in read, read
     assert r'contains(\"@codex review\")' in read, read
     assert "gh api" not in read, read
+    # HEAD_TIME is the commit date, not the head's appearance in the pull
+    # request, so scoping by it imports requests made for the PREVIOUS head. The
+    # window bounds itself against two head-bound artifacts and needs no clock.
+    assert "HEAD_TIME" not in read, read
 
     # And the guard actually consumes it, rather than the read being decorative.
-    assert '-v reqs="${REQ_TS:-}"' in SCRIPT
-    assert "if (qk == \"\" || qk < rk) n++" in SCRIPT
+    # Through ENVIRON, not `-v`: awk lexes a -v value as SOURCE, so the newline
+    # between two request timestamps is a syntax error rather than data and the
+    # guard aborts on exactly the two-request heads it exists for.
+    assert 'REQ_TS="${REQ_TS:-}" awk' in SCRIPT
+    assert 'split(ENVIRON["REQ_TS"], rq, "\\n")' in SCRIPT
+    assert "-v reqs=" not in SCRIPT
+    assert "if (qk != \"\" && qk > rk && qk < ck) { found = 1; break }" in SCRIPT
+
+
+def test_the_awk_program_is_one_single_quoted_string():
+    """An apostrophe inside the program closes the quote; the rest becomes shell.
+
+    The retraction program is passed to awk inside single quotes and carries `#`
+    comments of its own, so a possessive in one of them ends the quoted string
+    early. Everything after it is then parsed as shell and the run dies with a
+    syntax error pointing at an awk line, far from the comment that caused it —
+    the failure the behavior suite sees only as an unexplained non-zero exit.
+    """
+    lines = SCRIPT.splitlines()
+    start = next(i for i, ln in enumerate(lines) if "awk -v clean=" in ln)
+    end = next(i for i in range(start, len(lines)) if lines[i].rstrip().endswith("}'"))
+    program = "\n".join(lines[start : end + 1])
+    assert program.count("'") == 2, (
+        "the awk program must be exactly one single-quoted string; found "
+        f"{program.count(chr(39))} quote characters:\n{program}"
+    )
 
 
 
