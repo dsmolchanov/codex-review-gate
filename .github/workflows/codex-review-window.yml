@@ -913,6 +913,31 @@ jobs:
           # as the identity and waker probes: they feed no verdict.
           # ---------------------------------------------------------------
           if [ "${DEGRADED}" -eq 1 ] && [ -n "${RIDS}" ]; then
+            # NOT FOR A BOT'S PULL REQUEST. A debt record is a promise that a
+            # human will come back to a finding that merged. A dependency bump
+            # does not come back: nobody edits a bot's branch, and the bot
+            # replaces the pull request wholesale on its next run, so the
+            # record survives a change that was thrown away. Measured on
+            # 2026-09-11: 15 of the 17 records naming a pull request that
+            # closed unmerged were on a stale dependabot branch, and three of
+            # the four asking for a plan inventory were too.
+            #
+            # The gate ITSELF still runs on these pull requests — a dependency
+            # bump is exactly the class where a review earns its cost. Only the
+            # bookkeeping write is skipped.
+            #
+            # Fail-soft, and deliberately toward FILING: an author lookup that
+            # fails leaves PR_AUTHOR empty and the record is written, because
+            # an unrecorded finding is worse than a record on a bot branch.
+            PR_AUTHOR=$(gh api "repos/${REPO}/pulls/${PR}" --jq '.user.login' 2>/dev/null || true)
+            case "${PR_AUTHOR}" in
+              "dependabot[bot]")
+                echo "::notice::Review debt is not recorded for ${PR_AUTHOR}: a bot's branch is replaced, not revisited. The findings above still decided this round."
+                RIDS=""
+                ;;
+            esac
+          fi
+          if [ "${DEGRADED}" -eq 1 ] && [ -n "${RIDS}" ]; then
             # ONE ISSUE PER FINDING, not one per pull request. A bundle is
             # either open or closed for everything in it, so a single fixed
             # finding cannot be retired without either closing its unfixed
