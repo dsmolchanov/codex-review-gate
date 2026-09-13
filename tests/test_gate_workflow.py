@@ -197,18 +197,11 @@ def test_every_verdict_read_goes_through_the_failing_api_wrapper():
     # bookkeeping — reported as a ::warning telling a human to file the issue
     # by hand — and must never hold a merge the verdict already allowed.
     DEBT_READ = 'gh api "repos/${REPO}/pulls/${PR}/reviews/${RID}"'
-    # The author lookup is the fourth, for the same reason and with the same
-    # shape: it runs only after the verdict is decided, and it decides whether
-    # to WRITE a debt record, never whether to merge. It also fails toward
-    # filing — an empty author records the finding — so a swallowed failure
-    # cannot lose a record either.
-    AUTHOR_READ = 'gh api "repos/${REPO}/pulls/${PR}" --jq \'.user.login\''
     forbidden = [
         m for m in re.findall(r"gh api[^\n]*\|\| true", code)
         if not m.startswith(IDENTITY_PROBE)
         and not m.startswith(WAKER_PROBE)
         and not m.startswith(DEBT_READ)
-        and not m.startswith(AUTHOR_READ)
     ]
     assert not forbidden, "verdict read swallows failures:\n" + "\n".join(forbidden)
 
