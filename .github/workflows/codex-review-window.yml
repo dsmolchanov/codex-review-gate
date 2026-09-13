@@ -998,6 +998,11 @@ jobs:
                   GATE_REPO="${REPO}"
                   GATE_SHA="${GITHUB_SHA:-}"
                 fi
+                # Fail-soft: a repository that cannot take the label still
+                # takes the records.
+                gh label create review-debt --force -R "${REPO}" \
+                  --color "d93f0b" --description "Filed by the review gate on a degraded round" \
+                  >/dev/null 2>&1 || true
                 DEBT_DIR=$(mktemp -d)
                 DEBT_TOOL_RC=0
                 gh api "repos/${GATE_REPO}/contents/scripts/review_debt.py?ref=${GATE_SHA}" \
@@ -1025,7 +1030,13 @@ jobs:
                       fi
                       # `</dev/null` because this runs inside a `read` loop: a
                       # child that touched stdin would eat the remaining findings.
-                      if gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="$(cat "${DEBT_DIR}/${DEBT_N}.body")" </dev/null >/dev/null 2>&1; then
+                      # Labelled so a cross-repository triage board can select
+                      # these without parsing titles. Created fail-soft and
+                      # once per batch above; if the label is missing the
+                      # create below still succeeds without it, because a
+                      # record without a label beats no record.
+                      if gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="$(cat "${DEBT_DIR}/${DEBT_N}.body")" -f "labels[]=review-debt" </dev/null >/dev/null 2>&1 \
+                        || gh api "repos/${REPO}/issues" -f title="${DEBT_TITLE}" -f body="$(cat "${DEBT_DIR}/${DEBT_N}.body")" </dev/null >/dev/null 2>&1; then
                         FILED=$((FILED + 1))
                       else
                         echo "::warning::Could not file review debt for: ${DEBT_TITLE}. It merges unrecorded — file it by hand."

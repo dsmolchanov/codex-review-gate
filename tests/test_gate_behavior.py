@@ -1306,6 +1306,24 @@ def test_deferred_p1s_merge_and_are_filed_as_review_debt(tmp_path):
     assert "filed 1, already open 0" in result.stdout
 
 
+def test_a_filed_record_carries_the_review_debt_label(tmp_path):
+    """A cross-repository triage board selects on a label, not on a title
+    prefix. Records carried none until now, which is why the 2026-09-11 pass
+    had to classify 184 issues by parsing titles."""
+    fx = round_fixture(OLD1, OLD2, OLD3, head_review=True)
+    fx["routes"]["pulls/7/comments"] = {
+        "pull_request_review_id": debt_record("api/x.py", P1_BODY_NO_BLOCKER),
+        "*": "",
+    }
+    result = run_gate(tmp_path, fx)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    calls = posted_bodies(tmp_path)
+    assert "labels[]=review-debt" in calls, (
+        f"the record was filed without the label:\n{calls}"
+    )
+
+
 def test_a_bots_deferred_p1_merges_and_is_not_recorded(tmp_path):
     """A debt record promises a human comes back. Nobody edits a bot's branch.
 
