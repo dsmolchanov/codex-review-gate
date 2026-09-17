@@ -29,6 +29,21 @@ on:
         type: string
         required: false
         default: '["ubuntu-latest"]'
+      # Pull-request AUTHORS this gate does not review, as a comma-separated
+      # list of logins; empty by default, so a caller that says nothing keeps
+      # every pull request gated. The one intended member is `dependabot[bot]`:
+      # a dependency bump's diff is its title, and reviewing it spent a full
+      # gate generation and a Codex review per rebase — 46 gate runs on eight
+      # stale bumps in one day (2026-09-08). This is an opt-out for a NAMED,
+      # authenticated author on the caller's own say-so, not the repo-wide
+      # topic bypass this file refuses: it is visible in the caller's stub,
+      # and the skipped job still reports its check, so branch protection
+      # sees a skip — which it counts as satisfied — not a missing context.
+      exempt-authors:
+        description: Comma-separated PR-author logins the gate skips (e.g. dependabot[bot])
+        type: string
+        required: false
+        default: ''
     secrets:
       CODEX_REQUEST_TOKEN:
         required: false
@@ -144,8 +159,13 @@ on:
 
 jobs:
   codex-review-window:
-    # Draft PRs cannot merge, so skipping them is safe.
-    if: ${{ !github.event.pull_request.draft }}
+    # Draft PRs cannot merge, so skipping them is safe. An exempt author
+    # (see the input) is the other skip; the padding commas make the match
+    # whole-login, so `bot` never matches `dependabot[bot]`.
+    if: >-
+      ${{ !github.event.pull_request.draft &&
+          !contains(format(',{0},', inputs.exempt-authors),
+                    format(',{0},', github.event.pull_request.user.login)) }}
     # The `||` fallback is for this workflow's OWN pull_request triggers: a
     # direct run has no workflow_call inputs, so `inputs.runs-on` is empty
     # and a bare fromJSON('') fails before any runner is assigned. Hosted,

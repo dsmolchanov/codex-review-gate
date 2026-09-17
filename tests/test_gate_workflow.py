@@ -685,7 +685,7 @@ def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
     verdict would depend on the runner.
     """
     inputs = ON["workflow_call"]["inputs"]
-    assert set(inputs) == {"runs-on"}
+    assert set(inputs) == {"runs-on", "exempt-authors"}
     assert inputs["runs-on"]["type"] == "string"
     assert inputs["runs-on"]["required"] is False
     assert json.loads(inputs["runs-on"]["default"]) == ["ubuntu-latest"]
@@ -694,3 +694,20 @@ def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
     # hand fromJSON an empty string and fail before a runner is assigned.
     assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on || '[\"ubuntu-latest\"]') }}"
     assert "inputs.runs-on" not in SCRIPT
+
+
+def test_an_exempt_author_is_named_by_the_caller_and_nobody_by_default():
+    """The only opt-out is per author, on the caller's say-so, whole-login.
+
+    Empty by default, so a caller that passes nothing keeps every pull request
+    gated. The skip is a JOB condition, so the check is still reported — as
+    skipped, which branch protection counts as satisfied — rather than a
+    required context that never arrives. The padded-comma match is
+    whole-login: `bot` must not exempt `dependabot[bot]`.
+    """
+    inp = ON["workflow_call"]["inputs"]["exempt-authors"]
+    assert inp["default"] == "" and inp["required"] is False
+    cond = " ".join(JOB["if"].split())
+    assert "!github.event.pull_request.draft" in cond
+    assert "!contains(format(',{0},', inputs.exempt-authors), format(',{0},', github.event.pull_request.user.login))" in cond
+    assert "inputs.exempt-authors" not in SCRIPT
