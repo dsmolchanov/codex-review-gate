@@ -146,7 +146,11 @@ jobs:
   codex-review-window:
     # Draft PRs cannot merge, so skipping them is safe.
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # The `||` fallback is for this workflow's OWN pull_request triggers: a
+    # direct run has no workflow_call inputs, so `inputs.runs-on` is empty
+    # and a bare fromJSON('') fails before any runner is assigned. Hosted,
+    # matching the input's default — this repository is public.
+    runs-on: ${{ fromJSON(inputs.runs-on || '["ubuntu-latest"]') }}
     timeout-minutes: 25
     permissions:
       # A `permissions:` block zeroes every scope it does not list, so each API

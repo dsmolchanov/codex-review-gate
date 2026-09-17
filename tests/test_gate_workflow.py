@@ -689,5 +689,8 @@ def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
     assert inputs["runs-on"]["type"] == "string"
     assert inputs["runs-on"]["required"] is False
     assert json.loads(inputs["runs-on"]["default"]) == ["ubuntu-latest"]
-    assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on) }}"
+    # A direct pull_request run supplies no workflow_call inputs, so the
+    # expression must fall back — to the same hosted default — rather than
+    # hand fromJSON an empty string and fail before a runner is assigned.
+    assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on || '[\"ubuntu-latest\"]') }}"
     assert "inputs.runs-on" not in SCRIPT

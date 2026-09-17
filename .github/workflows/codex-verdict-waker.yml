@@ -105,7 +105,8 @@ jobs:
        contains(github.event.comment.body, 'Codex Review')) ||
       (github.event_name == 'pull_request_review' &&
        github.event.review.user.login == 'chatgpt-codex-connector[bot]')
-    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    # Same fallback as the gate: a direct run has no workflow_call inputs.
+    runs-on: ${{ fromJSON(inputs.runs-on || '["ubuntu-latest"]') }}
     # A few API reads, a bounded wait on an in-flight gate run, and one
     # serialized re-run per stale gate run, each waiting at most
     # WAKER_RECHECK_SECONDS (240s) for its predecessor. A gate run takes ~1-2
