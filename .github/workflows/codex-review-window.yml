@@ -14,6 +14,21 @@ on:
   # two repositories agreeing, several asking for tests that exist in two of the
   # eight. Reviewing it once, where the tests are, is the whole point.
   workflow_call:
+    inputs:
+      # Where the gate's one job runs, as a JSON array of runner labels. The
+      # default is GitHub-hosted, which is the only safe choice for a PUBLIC
+      # consumer: a fork's pull request runs this job, and a self-hosted box
+      # must never execute a stranger's event. A PRIVATE consumer passes its
+      # own labels — the job is a few API reads and a bounded wait, and on a
+      # hosted runner that wait was billed by the rounded-up minute across
+      # the whole fleet (Sep 9–16 2026: 1,913 billed minutes for the gate and
+      # 1,818 for the waker). The input changes WHERE the job runs, nothing
+      # about what it decides: no step reads it.
+      runs-on:
+        description: JSON array of runner labels for the gate job
+        type: string
+        required: false
+        default: '["ubuntu-latest"]'
     secrets:
       CODEX_REQUEST_TOKEN:
         required: false
@@ -131,7 +146,7 @@ jobs:
   codex-review-window:
     # Draft PRs cannot merge, so skipping them is safe.
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 25
     permissions:
       # A `permissions:` block zeroes every scope it does not list, so each API

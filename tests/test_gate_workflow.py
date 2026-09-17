@@ -14,6 +14,7 @@ timeout path exited 0.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -672,3 +673,21 @@ def test_degraded_p0_alerts_a_human():
     # merge, never instead of it.
     after = SCRIPT[SCRIPT.index(marker) :]
     assert re.search(r"^\s*exit 1\s*$", after, re.M)
+
+
+def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
+    """The job's placement is an input; its default is GitHub-hosted.
+
+    A public consumer receives fork pull requests, and a self-hosted box must
+    never run a stranger's event — so the default must stay hosted, and only a
+    caller that knows its repository is private may move the job. The input
+    decides WHERE the job runs and nothing else: no step may read it, or the
+    verdict would depend on the runner.
+    """
+    inputs = ON["workflow_call"]["inputs"]
+    assert set(inputs) == {"runs-on"}
+    assert inputs["runs-on"]["type"] == "string"
+    assert inputs["runs-on"]["required"] is False
+    assert json.loads(inputs["runs-on"]["default"]) == ["ubuntu-latest"]
+    assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on) }}"
+    assert "inputs.runs-on" not in SCRIPT

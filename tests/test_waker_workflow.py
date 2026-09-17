@@ -10,6 +10,7 @@ catch early: it must only ever ask the gate to look again.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -172,3 +173,20 @@ def test_waker_cannot_hang_a_runner():
     m = re.search(r"WAKER_RECHECK_SECONDS:-(\d+)", SCRIPT)
     assert m, "the in-flight re-check lost its bound"
     assert int(m.group(1)) <= 240
+
+
+def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
+    """Same contract as the gate: placement is an input, hosted by default.
+
+    The waker is the half of the protocol that sleeps, so it is the half that
+    gains most from leaving metered runners — but only a caller can know its
+    repository is private, so the default stays hosted and no step reads the
+    value.
+    """
+    inputs = ON["workflow_call"]["inputs"]
+    assert set(inputs) == {"runs-on"}
+    assert inputs["runs-on"]["type"] == "string"
+    assert inputs["runs-on"]["required"] is False
+    assert json.loads(inputs["runs-on"]["default"]) == ["ubuntu-latest"]
+    assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on) }}"
+    assert "inputs.runs-on" not in SCRIPT
