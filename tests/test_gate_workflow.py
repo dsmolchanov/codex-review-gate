@@ -14,6 +14,7 @@ timeout path exited 0.
 """
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -672,3 +673,41 @@ def test_degraded_p0_alerts_a_human():
     # merge, never instead of it.
     after = SCRIPT[SCRIPT.index(marker) :]
     assert re.search(r"^\s*exit 1\s*$", after, re.M)
+
+
+def test_runner_placement_is_the_callers_choice_and_hosted_by_default():
+    """The job's placement is an input; its default is GitHub-hosted.
+
+    A public consumer receives fork pull requests, and a self-hosted box must
+    never run a stranger's event — so the default must stay hosted, and only a
+    caller that knows its repository is private may move the job. The input
+    decides WHERE the job runs and nothing else: no step may read it, or the
+    verdict would depend on the runner.
+    """
+    inputs = ON["workflow_call"]["inputs"]
+    assert set(inputs) == {"runs-on", "exempt-authors"}
+    assert inputs["runs-on"]["type"] == "string"
+    assert inputs["runs-on"]["required"] is False
+    assert json.loads(inputs["runs-on"]["default"]) == ["ubuntu-latest"]
+    # A direct pull_request run supplies no workflow_call inputs, so the
+    # expression must fall back — to the same hosted default — rather than
+    # hand fromJSON an empty string and fail before a runner is assigned.
+    assert JOB["runs-on"] == "${{ fromJSON(inputs.runs-on || '[\"ubuntu-latest\"]') }}"
+    assert "inputs.runs-on" not in SCRIPT
+
+
+def test_an_exempt_author_is_named_by_the_caller_and_nobody_by_default():
+    """The only opt-out is per author, on the caller's say-so, whole-login.
+
+    Empty by default, so a caller that passes nothing keeps every pull request
+    gated. The skip is a JOB condition, so the check is still reported — as
+    skipped, which branch protection counts as satisfied — rather than a
+    required context that never arrives. The padded-comma match is
+    whole-login: `bot` must not exempt `dependabot[bot]`.
+    """
+    inp = ON["workflow_call"]["inputs"]["exempt-authors"]
+    assert inp["default"] == "" and inp["required"] is False
+    cond = " ".join(JOB["if"].split())
+    assert "!github.event.pull_request.draft" in cond
+    assert "!contains(format(',{0},', inputs.exempt-authors), format(',{0},', github.event.pull_request.user.login))" in cond
+    assert "inputs.exempt-authors" not in SCRIPT
